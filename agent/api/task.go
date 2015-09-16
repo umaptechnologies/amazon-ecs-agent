@@ -294,9 +294,15 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
 		return nil, &HostConfigError{err.Error()}
 	}
 
+        devices := make([]docker.Device, 3)
+        devices[0] = docker.Device{"/dev/nvidia0", "/dev/nvidia0", "rwm"}
+        devices[1] = docker.Device{"/dev/nvidiactl", "/dev/nvidiactl", "rwm"}
+        devices[2] = docker.Device{"/dev/nvidia-uvm", "/dev/nvidia-uvm", "rwm"}
+
 	hostConfig := &docker.HostConfig{
 		Links:        dockerLinkArr,
 		Binds:        binds,
+                Devices:      devices,
 		PortBindings: dockerPortMap,
 		VolumesFrom:  volumesFrom,
 	}
