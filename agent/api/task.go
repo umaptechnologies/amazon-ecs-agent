@@ -18,6 +18,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+        "os"
 
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
@@ -294,10 +295,14 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
 		return nil, &HostConfigError{err.Error()}
 	}
 
-        devices := make([]docker.Device, 3)
-        devices[0] = docker.Device{"/dev/nvidia0", "/dev/nvidia0", "rwm"}
-        devices[1] = docker.Device{"/dev/nvidiactl", "/dev/nvidiactl", "rwm"}
-        devices[2] = docker.Device{"/dev/nvidia-uvm", "/dev/nvidia-uvm", "rwm"}
+        // Attach the GPU devices if they exist
+        devices := make([]docker.Device, 0)
+        if _, err := os.Stat("/dev/nvidia0"); err == nil {
+            devices := make([]docker.Device, 3)
+            devices[0] = docker.Device{"/dev/nvidia0", "/dev/nvidia0", "rwm"}
+            devices[1] = docker.Device{"/dev/nvidiactl", "/dev/nvidiactl", "rwm"}
+            devices[2] = docker.Device{"/dev/nvidia-uvm", "/dev/nvidia-uvm", "rwm"}
+        }
 
 	hostConfig := &docker.HostConfig{
 		Links:        dockerLinkArr,
