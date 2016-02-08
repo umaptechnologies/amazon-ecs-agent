@@ -16,6 +16,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+        "fmt"
 	"strconv"
 	"strings"
         "os"
@@ -296,22 +297,35 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
 	}
 
         // Attach the GPU devices if they exist
-        devices := make([]docker.Device, 0)
+        fmt.Printf("Should I attach GPU devices?\n")
         if _, err := os.Stat("/dev/nvidia0"); err == nil {
+            fmt.Printf("Attaching the GPU devices!\n")
             devices := make([]docker.Device, 3)
             devices[0] = docker.Device{"/dev/nvidia0", "/dev/nvidia0", "rwm"}
             devices[1] = docker.Device{"/dev/nvidiactl", "/dev/nvidiactl", "rwm"}
             devices[2] = docker.Device{"/dev/nvidia-uvm", "/dev/nvidia-uvm", "rwm"}
-        }
 
-	hostConfig := &docker.HostConfig{
+            hostConfig := &docker.HostConfig{
+                Links:        dockerLinkArr,
+                Binds:        binds,
+                Devices:      devices,
+                PortBindings: dockerPortMap,
+                VolumesFrom:  volumesFrom,
+            }
+            return hostConfig, nil
+        } else {
+            fmt.Printf("Not attaching the GPU devices!\n")
+            devices := make([]docker.Device, 0)
+
+            hostConfig := &docker.HostConfig{
 		Links:        dockerLinkArr,
 		Binds:        binds,
                 Devices:      devices,
 		PortBindings: dockerPortMap,
 		VolumesFrom:  volumesFrom,
-	}
-	return hostConfig, nil
+	    }
+	    return hostConfig, nil
+        }
 }
 
 func (task *Task) dockerLinks(container *Container, dockerContainerMap map[string]*DockerContainer) ([]string, error) {
