@@ -163,7 +163,7 @@ func (engine *DockerStatsEngine) GetInstanceMetrics() (*ecstcs.MetricsMetadata, 
 	metricsMetadata := &ecstcs.MetricsMetadata{
 		Cluster:           aws.String(engine.cluster),
 		ContainerInstance: aws.String(engine.containerInstanceArn),
-		Idle:              aws.Boolean(idle),
+		Idle:              aws.Bool(idle),
 		MessageId:         aws.String(uuid.NewRandom().String()),
 	}
 
@@ -220,7 +220,7 @@ func (engine *DockerStatsEngine) isIdle() bool {
 // initDockerClient initializes engine's docker client.
 func (engine *DockerStatsEngine) initDockerClient() error {
 	if engine.client == nil {
-		client, err := ecsengine.NewDockerGoClient()
+		client, err := ecsengine.NewDockerGoClient(nil, "", config.NewSensitiveRawMessage([]byte("")), false)
 		if err != nil {
 			return err
 		}

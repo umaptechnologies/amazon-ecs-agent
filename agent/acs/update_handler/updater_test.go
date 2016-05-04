@@ -100,7 +100,7 @@ func TestFullUpdateFlow(t *testing.T) {
 		t.Error("Incorrect data written")
 	}
 
-	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg))(&ecsacs.PerformUpdateMessage{
+	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg, false))(&ecsacs.PerformUpdateMessage{
 		ClusterArn:           ptr("cluster").(*string),
 		ContainerInstanceArn: ptr("containerInstance").(*string),
 		MessageId:            ptr("mid2").(*string),
@@ -121,11 +121,9 @@ func (m *nackRequestMatcher) Matches(nack interface{}) bool {
 		return false
 	}
 	if m.ContainerInstance != nil && *m.ContainerInstance != *other.ContainerInstance {
-		fmt.Println(*other.ContainerInstance)
 		return false
 	}
 	if m.MessageId != nil && *m.MessageId != *other.MessageId {
-		fmt.Println(*other.MessageId)
 		return false
 	}
 	if m.Reason != nil && *m.Reason != *other.Reason {
@@ -165,7 +163,7 @@ func TestUndownloadedUpdate(t *testing.T) {
 		MessageId:         ptr("mid").(*string),
 	}})
 
-	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg))(&ecsacs.PerformUpdateMessage{
+	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg, false))(&ecsacs.PerformUpdateMessage{
 		ClusterArn:           ptr("cluster").(*string),
 		ContainerInstanceArn: ptr("containerInstance").(*string),
 		MessageId:            ptr("mid").(*string),
@@ -225,7 +223,7 @@ func TestDuplicateUpdateMessagesWithSuccess(t *testing.T) {
 		t.Error("Incorrect data written")
 	}
 
-	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg))(&ecsacs.PerformUpdateMessage{
+	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg, false))(&ecsacs.PerformUpdateMessage{
 		ClusterArn:           ptr("cluster").(*string),
 		ContainerInstanceArn: ptr("containerInstance").(*string),
 		MessageId:            ptr("mid3").(*string),
@@ -292,7 +290,7 @@ func TestDuplicateUpdateMessagesWithFailure(t *testing.T) {
 		t.Error("Incorrect data written")
 	}
 
-	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg))(&ecsacs.PerformUpdateMessage{
+	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg, false))(&ecsacs.PerformUpdateMessage{
 		ClusterArn:           ptr("cluster").(*string),
 		ContainerInstanceArn: ptr("containerInstance").(*string),
 		MessageId:            ptr("mid3").(*string),
@@ -369,7 +367,7 @@ func TestNewerUpdateMessages(t *testing.T) {
 		t.Error("Incorrect data written")
 	}
 
-	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg))(&ecsacs.PerformUpdateMessage{
+	u.performUpdateHandler(statemanager.NewNoopStateManager(), engine.NewTaskEngine(cfg, false))(&ecsacs.PerformUpdateMessage{
 		ClusterArn:           ptr("cluster").(*string),
 		ContainerInstanceArn: ptr("containerInstance").(*string),
 		MessageId:            ptr("mid2").(*string),

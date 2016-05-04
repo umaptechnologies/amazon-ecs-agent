@@ -28,6 +28,9 @@ type TaskEngine interface {
 	// this task engine from processing new tasks
 	Disable()
 
+	// TaskEvents will provide information about tasks that have been previously
+	// executed. Specifically, it will provide information when they reach
+	// running or stopped, as well as providing portbinding and other metadata
 	TaskEvents() (<-chan api.TaskStateChange, <-chan api.ContainerStateChange)
 	SetSaver(statemanager.Saver)
 
@@ -35,9 +38,16 @@ type TaskEngine interface {
 	// lifecycle. If it returns an error, the task was not added.
 	AddTask(*api.Task) error
 
+	// ListTasks lists all the tasks being managed by the TaskEngine.
 	ListTasks() ([]*api.Task, error)
 
+	// GetTaskByArn gets a managed task, given a task arn.
+	GetTaskByArn(string) (*api.Task, bool)
+
 	Version() (string, error)
+	// Capabilities returns an array of capabilities this task engine has, which
+	// should model what it can execute.
+	Capabilities() []string
 
 	json.Marshaler
 	json.Unmarshaler

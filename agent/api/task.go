@@ -24,7 +24,7 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
-	"github.com/aws/aws-sdk-go/internal/protocol/json/jsonutil"
+	"github.com/aws/aws-sdk-go/private/protocol/json/jsonutil"
 	"github.com/fsouza/go-dockerclient"
 )
 
@@ -222,18 +222,33 @@ func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerCli
 		Env:          dockerEnv,
 		Memory:       dockerMem,
 		CPUShares:    task.dockerCpuShares(container.Cpu),
-		Labels: map[string]string{
-			"com.amazonaws.ecs.task-arn":                task.Arn,
-			"com.amazonaws.ecs.container-name":          container.Name,
-			"com.amazonaws.ecs.task-definition-family":  task.Family,
-			"com.amazonaws.ecs.task-definition-version": task.Version,
-		},
 	}
+
+	if container.DockerConfig.Config != nil {
+		err := json.Unmarshal([]byte(*container.DockerConfig.Config), &config)
+		if err != nil {
+			return nil, &DockerClientConfigError{"Unable decode given docker config: " + err.Error()}
+		}
+	}
+	if config.Labels == nil {
+		config.Labels = make(map[string]string)
+	}
+
+	// Augment labels with some metadata from the agent. Explicitly do this last
+	// such that it will always override duplicates in the provided raw config
+	// data.
+	config.Labels["com.amazonaws.ecs.task-arn"] = task.Arn
+	config.Labels["com.amazonaws.ecs.container-name"] = container.Name
+	config.Labels["com.amazonaws.ecs.task-definition-family"] = task.Family
+	config.Labels["com.amazonaws.ecs.task-definition-version"] = task.Version
+
 	return config, nil
 }
 
-// Docker silently converts 0 to 1024 CPU shares, which is probably not what we want.
-// Instead, we convert 0 to 1 to be closer to expected behavior.
+// Docker silently converts 0 to 1024 CPU shares, which is probably not what we
+// want.  Instead, we convert 0 to 2 to be closer to expected behavior. The
+// reason for 2 over 1 is that 1 is an invalid value (Linux's choice, not
+// Docker's).
 func (task *Task) dockerCpuShares(containerCpu uint) int64 {
 	if containerCpu <= 1 {
 		log.Debug("Converting CPU shares to allowed minimum of 2", "task", task.Arn, "cpuShares", containerCpu)
@@ -323,9 +338,16 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
                 Devices:      devices,
 		PortBindings: dockerPortMap,
 		VolumesFrom:  volumesFrom,
-	    }
-	    return hostConfig, nil
-        }
+	}
+
+	if container.DockerConfig.HostConfig != nil {
+		err := json.Unmarshal([]byte(*container.DockerConfig.HostConfig), hostConfig)
+		if err != nil {
+			return nil, &HostConfigError{"Unable to decode given host config: " + err.Error()}
+		}
+	}
+
+	return hostConfig, nil
 }
 
 func (task *Task) dockerLinks(container *Container, dockerContainerMap map[string]*DockerContainer) ([]string, error) {

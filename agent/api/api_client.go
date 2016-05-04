@@ -22,6 +22,7 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/docker/docker/pkg/system"
 
 	"github.com/aws/amazon-ecs-agent/agent/config"
@@ -43,7 +44,7 @@ type ECSClient interface {
 	// ContainerInstanceARN if successful. Supplying a non-empty container
 	// instance ARN allows a container instance to update its registered
 	// resources.
-	RegisterContainerInstance(existingContainerInstanceArn string) (string, error)
+	RegisterContainerInstance(existingContainerInstanceArn string, attributes []string) (string, error)
 	// SubmitTaskStateChange sends a state change and returns an error
 	// indicating if it was submitted
 	SubmitTaskStateChange(change TaskStateChange) error
@@ -93,12 +94,6 @@ func (client *ApiECSClient) SetSubmitStateChangeSDK(sdk ECSSubmitStateSDK) {
 	client.submitStateChangeClient = sdk
 }
 
-// SetEC2MetadataClient overrides the EC2 Metadata Client to the given one.
-// This is useful for injecting a test implementation
-func (client *ApiECSClient) SetEC2MetadataClient(ec2MetadataClient ec2.EC2MetadataClient) {
-	client.ec2metadata = ec2MetadataClient
-}
-
 const (
 	ECS_SERVICE = "ecs"
 
@@ -107,23 +102,22 @@ const (
 	RoundtripTimeout = 5 * time.Second
 )
 
-func NewECSClient(credentialProvider *credentials.Credentials, config *config.Config, httpClient *http.Client) ECSClient {
-	ecsConfig := aws.DefaultConfig.Copy()
+func NewECSClient(credentialProvider *credentials.Credentials, config *config.Config, httpClient *http.Client, ec2MetadataClient ec2.EC2MetadataClient) ECSClient {
+	var ecsConfig aws.Config
 	ecsConfig.Credentials = credentialProvider
-	ecsConfig.Region = config.AWSRegion
+	ecsConfig.Region = &config.AWSRegion
 	ecsConfig.HTTPClient = httpClient
 	if config.APIEndpoint != "" {
-		ecsConfig.Endpoint = config.APIEndpoint
+		ecsConfig.Endpoint = &config.APIEndpoint
 	}
-	standardClient := ecs.New(&ecsConfig)
+	standardClient := ecs.New(session.New(&ecsConfig))
 	submitStateChangeClient := newSubmitStateChangeClient(&ecsConfig)
-	ec2metadataclient := ec2.DefaultClient
 	return &ApiECSClient{
 		credentialProvider:      credentialProvider,
 		config:                  config,
 		standardClient:          standardClient,
 		submitStateChangeClient: submitStateChangeClient,
-		ec2metadata:             ec2metadataclient,
+		ec2metadata:             ec2MetadataClient,
 	}
 }
 
@@ -150,7 +144,7 @@ func (client *ApiECSClient) CreateCluster(clusterName string) (string, error) {
 	return *resp.Cluster.ClusterName, nil
 }
 
-func (client *ApiECSClient) RegisterContainerInstance(containerInstanceArn string) (string, error) {
+func (client *ApiECSClient) RegisterContainerInstance(containerInstanceArn string, attributes []string) (string, error) {
 	clusterRef := client.config.Cluster
 	// If our clusterRef is empty, we should try to create the default
 	if clusterRef == "" {
@@ -161,7 +155,7 @@ func (client *ApiECSClient) RegisterContainerInstance(containerInstanceArn strin
 		}()
 		// Attempt to register without checking existence of the cluster so we don't require
 		// excess permissions in the case where the cluster already exists and is active
-		containerInstanceArn, err := client.registerContainerInstance(clusterRef, containerInstanceArn)
+		containerInstanceArn, err := client.registerContainerInstance(clusterRef, containerInstanceArn, attributes)
 		if err == nil {
 			return containerInstanceArn, nil
 		}
@@ -172,13 +166,19 @@ func (client *ApiECSClient) RegisterContainerInstance(containerInstanceArn strin
 			return "", err
 		}
 	}
-	return client.registerContainerInstance(clusterRef, containerInstanceArn)
+	return client.registerContainerInstance(clusterRef, containerInstanceArn, attributes)
 }
 
-func (client *ApiECSClient) registerContainerInstance(clusterRef string, containerInstanceArn string) (string, error) {
+func (client *ApiECSClient) registerContainerInstance(clusterRef string, containerInstanceArn string, attributes []string) (string, error) {
 	registerRequest := ecs.RegisterContainerInstanceInput{Cluster: &clusterRef}
 	if containerInstanceArn != "" {
-		registerRequest.ContainerInstanceARN = &containerInstanceArn
+		registerRequest.ContainerInstanceArn = &containerInstanceArn
+	}
+
+	for _, attribute := range attributes {
+		registerRequest.Attributes = append(registerRequest.Attributes, &ecs.Attribute{
+			Name: aws.String(attribute),
+		})
 	}
 
 	instanceIdentityDoc, err := client.ec2metadata.ReadResource(ec2.INSTANCE_IDENTITY_DOCUMENT_RESOURCE)
@@ -238,7 +238,7 @@ func (client *ApiECSClient) registerContainerInstance(clusterRef string, contain
 		return "", err
 	}
 	log.Info("Registered!")
-	return *resp.ContainerInstance.ContainerInstanceARN, nil
+	return *resp.ContainerInstance.ContainerInstanceArn, nil
 }
 
 func (client *ApiECSClient) SubmitTaskStateChange(change TaskStateChange) error {

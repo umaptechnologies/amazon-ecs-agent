@@ -15,6 +15,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	mathrand "math/rand"
 	"os"
 	"runtime"
@@ -36,8 +37,8 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	utilatomic "github.com/aws/amazon-ecs-agent/agent/utils/atomic"
 	"github.com/aws/amazon-ecs-agent/agent/version"
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/defaults"
 	log "github.com/cihub/seelog"
 	"golang.org/x/net/context"
 )
@@ -54,21 +55,44 @@ func main() {
 }
 func _main() int {
 	defer log.Flush()
-	versionFlag := flag.Bool("version", false, "Print the agent version information and exit")
-	acceptInsecureCert := flag.Bool("k", false, "Do not verify ssl certs")
-	logLevel := flag.String("loglevel", "", "Loglevel: [<crit>|<error>|<warn>|<info>|<debug>]")
-	flag.Parse()
+	flagset := flag.NewFlagSet("Amazon ECS Agent", flag.ContinueOnError)
+	versionFlag := flagset.Bool("version", false, "Print the agent version information and exit")
+	logLevel := flagset.String("loglevel", "", "Loglevel: [<crit>|<error>|<warn>|<info>|<debug>]")
+	acceptInsecureCert := flagset.Bool("k", false, "Disable SSL certificate verification. We do not recommend setting this option.")
+	licenseFlag := flagset.Bool("license", false, "Print the LICENSE and NOTICE files and exit")
+	blackholeEc2Metadata := flagset.Bool("blackhole-ec2-metadata", false, "Blackhole the EC2 Metadata requests. Setting this option can cause the ECS Agent to fail to work properly.  We do not recommend setting this option")
+	err := flagset.Parse(os.Args[1:])
+	if err != nil {
+		return exitcodes.ExitTerminal
+	}
+
+	if *licenseFlag {
+		license := utils.NewLicenseProvider()
+		text, err := license.GetText()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return exitcodes.ExitError
+		}
+		fmt.Println(text)
+		return exitcodes.ExitSuccess
+	}
 
 	logger.SetLevel(*logLevel)
+	ec2MetadataClient := ec2.DefaultClient
+	if *blackholeEc2Metadata {
+		ec2MetadataClient = ec2.NewBlackholeEC2MetadataClient()
+	}
 
 	log.Infof("Starting Agent: %v", version.String())
-
+	if *acceptInsecureCert {
+		log.Warn("SSL certificate verification disabled. This is not recommended.")
+	}
 	log.Info("Loading configuration")
-	cfg, err := config.NewConfig()
+	cfg, err := config.NewConfig(ec2MetadataClient)
 	// Load cfg before doing 'versionFlag' so that it has the DOCKER_HOST
 	// variable loaded if needed
 	if *versionFlag {
-		versionableEngine := engine.NewTaskEngine(cfg)
+		versionableEngine := engine.NewTaskEngine(cfg, *acceptInsecureCert)
 		version.PrintVersion(versionableEngine)
 		return exitcodes.ExitSuccess
 	}
@@ -89,7 +113,7 @@ func _main() int {
 	if cfg.Checkpoint {
 		log.Info("Checkpointing is enabled. Attempting to load state")
 		var previousCluster, previousEc2InstanceID, previousContainerInstanceArn string
-		previousTaskEngine := engine.NewTaskEngine(cfg)
+		previousTaskEngine := engine.NewTaskEngine(cfg, *acceptInsecureCert)
 		// previousState is used to verify that our current runtime configuration is
 		// compatible with our past configuration as reflected by our state-file
 		previousState, err := initializeStateManager(cfg, previousTaskEngine, &previousCluster, &previousContainerInstanceArn, &previousEc2InstanceID, acshandler.SequenceNumber)
@@ -119,7 +143,7 @@ func _main() int {
 			log.Infof("Restored cluster '%v'", cfg.Cluster)
 		}
 
-		if instanceIdentityDoc, err := ec2.GetInstanceIdentityDocument(); err == nil {
+		if instanceIdentityDoc, err := ec2MetadataClient.InstanceIdentityDocument(); err == nil {
 			currentEc2InstanceID = instanceIdentityDoc.InstanceId
 		} else {
 			log.Criticalf("Unable to access EC2 Metadata service to determine EC2 ID: %v", err)
@@ -129,7 +153,7 @@ func _main() int {
 			log.Warnf("Data mismatch; saved InstanceID '%v' does not match current InstanceID '%v'. Overwriting old datafile", previousEc2InstanceID, currentEc2InstanceID)
 
 			// Reset taskEngine; all the other values are still default
-			taskEngine = engine.NewTaskEngine(cfg)
+			taskEngine = engine.NewTaskEngine(cfg, *acceptInsecureCert)
 		} else {
 			// Use the values we loaded if there's no issue
 			containerInstanceArn = previousContainerInstanceArn
@@ -137,7 +161,7 @@ func _main() int {
 		}
 	} else {
 		log.Info("Checkpointing not enabled; a new container instance will be created each time the agent is run")
-		taskEngine = engine.NewTaskEngine(cfg)
+		taskEngine = engine.NewTaskEngine(cfg, *acceptInsecureCert)
 	}
 
 	stateManager, err := initializeStateManager(cfg, taskEngine, &cfg.Cluster, &containerInstanceArn, &currentEc2InstanceID, acshandler.SequenceNumber)
@@ -146,16 +170,21 @@ func _main() int {
 		return exitcodes.ExitTerminal
 	}
 
-	credentialProvider := aws.DefaultChainCredentials
+	capabilities := taskEngine.Capabilities()
+
+	// We instantiate our own credentialProvider for use in acs/tcs. This tries
+	// to mimic roughly the way it's instantiated by the SDK for a default
+	// session.
+	credentialProvider := defaults.CredChain(defaults.Config(), defaults.Handlers())
 	// Preflight request to make sure they're good
 	if preflightCreds, err := credentialProvider.Get(); err != nil || preflightCreds.AccessKeyID == "" {
 		log.Warnf("Error getting valid credentials (AKID %v): %v", preflightCreds.AccessKeyID, err)
 	}
-	client := api.NewECSClient(credentialProvider, cfg, httpclient.New(api.RoundtripTimeout, *acceptInsecureCert))
+	client := api.NewECSClient(credentialProvider, cfg, httpclient.New(api.RoundtripTimeout, *acceptInsecureCert), ec2MetadataClient)
 
 	if containerInstanceArn == "" {
 		log.Info("Registering Instance with ECS")
-		containerInstanceArn, err = client.RegisterContainerInstance("")
+		containerInstanceArn, err = client.RegisterContainerInstance("", capabilities)
 		if err != nil {
 			log.Errorf("Error registering: %v", err)
 			if retriable, ok := err.(utils.Retriable); ok && !retriable.Retry() {
@@ -168,13 +197,14 @@ func _main() int {
 		stateManager.Save()
 	} else {
 		log.Infof("Restored from checkpoint file. I am running as '%v' in cluster '%v'", containerInstanceArn, cfg.Cluster)
-		_, err = client.RegisterContainerInstance(containerInstanceArn)
+		_, err = client.RegisterContainerInstance(containerInstanceArn, capabilities)
 		if err != nil {
-			log.Errorf("Error registering: %v", err)
+			log.Errorf("Error re-registering: %v", err)
 			if awserr, ok := err.(awserr.Error); ok && api.IsInstanceTypeChangedError(awserr) {
 				log.Criticalf("The current instance type does not match the registered instance type. Please revert the instance type change, or alternatively launch a new instance. Error: %v", err)
 				return exitcodes.ExitTerminal
 			}
+			return exitcodes.ExitError
 		}
 	}
 

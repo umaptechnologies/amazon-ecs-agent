@@ -20,18 +20,14 @@ import (
 )
 
 type AckPublishMetric struct {
+	_ struct{} `type:"structure"`
+
 	Message *string `locationName:"message" type:"string"`
-
-	metadataAckPublishMetric `json:"-" xml:"-"`
-}
-
-type metadataAckPublishMetric struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s AckPublishMetric) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -40,18 +36,14 @@ func (s AckPublishMetric) GoString() string {
 }
 
 type BadRequestException struct {
+	_ struct{} `type:"structure"`
+
 	Message *string `locationName:"message" type:"string"`
-
-	metadataBadRequestException `json:"-" xml:"-"`
-}
-
-type metadataBadRequestException struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s BadRequestException) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -60,6 +52,8 @@ func (s BadRequestException) GoString() string {
 }
 
 type CWStatsSet struct {
+	_ struct{} `type:"structure"`
+
 	Max *float64 `locationName:"max" type:"double"`
 
 	Min *float64 `locationName:"min" type:"double"`
@@ -67,17 +61,11 @@ type CWStatsSet struct {
 	SampleCount *int64 `locationName:"sampleCount" type:"integer"`
 
 	Sum *float64 `locationName:"sum" type:"double"`
-
-	metadataCWStatsSet `json:"-" xml:"-"`
-}
-
-type metadataCWStatsSet struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s CWStatsSet) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -86,20 +74,16 @@ func (s CWStatsSet) GoString() string {
 }
 
 type ContainerMetric struct {
+	_ struct{} `type:"structure"`
+
 	CpuStatsSet *CWStatsSet `locationName:"cpuStatsSet" type:"structure"`
 
 	MemoryStatsSet *CWStatsSet `locationName:"memoryStatsSet" type:"structure"`
-
-	metadataContainerMetric `json:"-" xml:"-"`
-}
-
-type metadataContainerMetric struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s ContainerMetric) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -108,18 +92,14 @@ func (s ContainerMetric) GoString() string {
 }
 
 type HeartbeatMessage struct {
+	_ struct{} `type:"structure"`
+
 	Healthy *bool `locationName:"healthy" type:"boolean"`
-
-	metadataHeartbeatMessage `json:"-" xml:"-"`
-}
-
-type metadataHeartbeatMessage struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s HeartbeatMessage) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -128,16 +108,12 @@ func (s HeartbeatMessage) GoString() string {
 }
 
 type HeartbeatOutput struct {
-	metadataHeartbeatOutput `json:"-" xml:"-"`
-}
-
-type metadataHeartbeatOutput struct {
-	SDKShapeTraits bool `type:"structure"`
+	_ struct{} `type:"structure"`
 }
 
 // String returns the string representation
 func (s HeartbeatOutput) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -146,18 +122,14 @@ func (s HeartbeatOutput) GoString() string {
 }
 
 type InvalidParameterException struct {
+	_ struct{} `type:"structure"`
+
 	Message *string `locationName:"message" type:"string"`
-
-	metadataInvalidParameterException `json:"-" xml:"-"`
-}
-
-type metadataInvalidParameterException struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s InvalidParameterException) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -166,6 +138,8 @@ func (s InvalidParameterException) GoString() string {
 }
 
 type MetricsMetadata struct {
+	_ struct{} `type:"structure"`
+
 	Cluster *string `locationName:"cluster" type:"string"`
 
 	ContainerInstance *string `locationName:"containerInstance" type:"string"`
@@ -175,17 +149,11 @@ type MetricsMetadata struct {
 	Idle *bool `locationName:"idle" type:"boolean"`
 
 	MessageId *string `locationName:"messageId" type:"string"`
-
-	metadataMetricsMetadata `json:"-", xml:"-"`
-}
-
-type metadataMetricsMetadata struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s MetricsMetadata) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -194,22 +162,18 @@ func (s MetricsMetadata) GoString() string {
 }
 
 type PublishMetricsRequest struct {
+	_ struct{} `type:"structure"`
+
 	Metadata *MetricsMetadata `locationName:"metadata" type:"structure"`
 
 	TaskMetrics []*TaskMetric `locationName:"taskMetrics" type:"list"`
 
 	Timestamp *time.Time `locationName:"timestamp" type:"timestamp" timestampFormat:"unix"`
-
-	metadataPublishMetricsRequest `json:"-" xml:"-"`
-}
-
-type metadataPublishMetricsRequest struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s PublishMetricsRequest) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -218,18 +182,14 @@ func (s PublishMetricsRequest) GoString() string {
 }
 
 type ResourceValidationException struct {
+	_ struct{} `type:"structure"`
+
 	Message *string `locationName:"message" type:"string"`
-
-	metadataResourceValidationException `json:"-" xml:"-"`
-}
-
-type metadataResourceValidationException struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s ResourceValidationException) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -238,18 +198,14 @@ func (s ResourceValidationException) GoString() string {
 }
 
 type ServerException struct {
+	_ struct{} `type:"structure"`
+
 	Message *string `locationName:"message" type:"string"`
-
-	metadataServerException `json:"-" xml:"-"`
-}
-
-type metadataServerException struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s ServerException) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -258,20 +214,16 @@ func (s ServerException) GoString() string {
 }
 
 type StartTelemetrySessionRequest struct {
+	_ struct{} `type:"structure"`
+
 	Cluster *string `locationName:"cluster" type:"string"`
 
 	ContainerInstance *string `locationName:"containerInstance" type:"string"`
-
-	metadataStartTelemetrySessionRequest `json:"-" xml:"-"`
-}
-
-type metadataStartTelemetrySessionRequest struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s StartTelemetrySessionRequest) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -280,18 +232,14 @@ func (s StartTelemetrySessionRequest) GoString() string {
 }
 
 type StopTelemetrySessionMessage struct {
+	_ struct{} `type:"structure"`
+
 	Message *string `locationName:"message" type:"string"`
-
-	metadataStopTelemetrySessionMessage `json:"-" xml:"-"`
-}
-
-type metadataStopTelemetrySessionMessage struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s StopTelemetrySessionMessage) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation
@@ -300,6 +248,8 @@ func (s StopTelemetrySessionMessage) GoString() string {
 }
 
 type TaskMetric struct {
+	_ struct{} `type:"structure"`
+
 	ContainerMetrics []*ContainerMetric `locationName:"containerMetrics" type:"list"`
 
 	TaskArn *string `locationName:"taskArn" type:"string"`
@@ -307,17 +257,11 @@ type TaskMetric struct {
 	TaskDefinitionFamily *string `locationName:"taskDefinitionFamily" type:"string"`
 
 	TaskDefinitionVersion *string `locationName:"taskDefinitionVersion" type:"string"`
-
-	metadataTaskMetric `json:"-" xml:"-"`
-}
-
-type metadataTaskMetric struct {
-	SDKShapeTraits bool `type:"structure"`
 }
 
 // String returns the string representation
 func (s TaskMetric) String() string {
-	return awsutil.StringValue(s)
+	return awsutil.Prettify(s)
 }
 
 // GoString returns the string representation

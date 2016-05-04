@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.8.2
+* Bug - Fixed an issue where `exec_create` and `exec_start` events were not
+  correctly ignored with some Docker versions.
+* Bug - Fixed memory utilization computation. 
+* Bug - Resolved a bug where sending a signal to a container caused the
+  agent to treat the container as dead.
+
+## 1.8.1
+* Bug - Fixed a potential deadlock in docker_task_engine.
+
+## 1.8.0
+* Feature - Task cleanup wait time is now configurable.
+* Enhancement - Improved testing for HTTP handler tests.
+* Enhancement - Updated AWS SDK to v.1.0.11.
+* Bug - Fixed a race condition in a docker-task-engine test.
+* Bug - Fixed an issue where dockerID was not persisted in the case of an
+  error.
+
+## 1.7.1
+* Enhancement - Increase `docker inspect` timeout to improve reliability under
+  some workloads.
+* Enhancement - Increase connect timeout for websockets to improve reliability
+  under some workloads.
+* Bug - Fixed memory leak in telemetry ticker loop.
+
+## 1.7.0
+* Feature - Add support for pulling from Amazon EC2 Container Registry.
+* Bug - Resolved an issue where containers could be incorrectly assumed stopped
+  when an OOM event was emitted by Docker.
+* Bug - Fixed an issue where a crash could cause recently-created containers to
+  become untracked.
+
+## 1.6.0
+
+* Feature - Add experimental HTTP proxy support.
+* Enhancement - No longer erroneously store an archive of all logs in the
+  container, greatly decreasing memory and CPU usage when rotating at the
+  hour.
+* Enhancement - Increase `docker create` timeout to improve reliability under
+  some workloads.
+* Bug - Resolved an issue where private repositories required a schema in
+  `AuthData` to work.
+* Bug - Fixed issue whereby metric submission could fail and never retry.
+
+## 1.5.0
+* Feature - Add support for additional Docker features.
+* Feature - Detect and register capabilities.
+* Feature - Add -license flag and /license handler.
+* Enhancement - Properly handle throttling.
+* Enhancement - Make it harder to accidentally expose sensitive data.
+* Enhancement - Increased reliability in functional tests.
+* Bug - Fixed potential divide-by-zero error with metrics.
+
 ## 1.4.0
 * Feature - Telemetry reporting for Services and Clusters.
 * Bug - Fixed an issue where some network errors would cause a panic.

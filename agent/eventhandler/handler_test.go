@@ -15,7 +15,6 @@ package eventhandler
 
 import (
 	"errors"
-	"fmt"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -37,7 +36,7 @@ type MockECSClient struct {
 func (m *MockECSClient) CredentialProvider() *credentials.Credentials {
 	return credentials.AnonymousCredentials
 }
-func (m *MockECSClient) RegisterContainerInstance(string) (string, error) {
+func (m *MockECSClient) RegisterContainerInstance(string, []string) (string, error) {
 	return "", nil
 }
 func (m *MockECSClient) DiscoverPollEndpoint(string) (string, error) {
@@ -205,8 +204,6 @@ func TestSendsEvents(t *testing.T) {
 	// N events should be waiting for potential errors; verify this is so
 	time.Sleep(5 * time.Millisecond)
 	if contCalls != concurrentEventCalls {
-		fmt.Println(contCalls)
-		fmt.Println(concurrentEventCalls)
 		t.Error("Too many event calls got through concurrently")
 	}
 	// Let one through

@@ -23,32 +23,48 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
+	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/handlers"
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ecs"
-	"github.com/fsouza/go-dockerclient"
+	"github.com/aws/aws-sdk-go/aws/session"
+	docker "github.com/fsouza/go-dockerclient"
 )
 
 var ECS *ecs.ECS
 var Cluster string
 
 func init() {
-	if iid, err := ec2.GetInstanceIdentityDocument(); err == nil {
-		ECS = ecs.New(&aws.Config{Region: iid.Region})
-	} else {
-		ECS = ecs.New(nil)
+	var ecsconfig aws.Config
+	if region := os.Getenv("AWS_REGION"); region != "" {
+		ecsconfig.Region = &region
+	}
+	if region := os.Getenv("AWS_DEFAULT_REGION"); region != "" {
+		ecsconfig.Region = &region
+	}
+	if ecsconfig.Region == nil {
+		if iid, err := ec2.GetInstanceIdentityDocument(); err == nil {
+			ecsconfig.Region = &iid.Region
+		}
+	}
+	if envEndpoint := os.Getenv("ECS_BACKEND_HOST"); envEndpoint != "" {
+		ecsconfig.Endpoint = &envEndpoint
 	}
 
+	ECS = ecs.New(session.New(&ecsconfig))
 	Cluster = "ecs-functional-tests"
 	if envCluster := os.Getenv("ECS_CLUSTER"); envCluster != "" {
 		Cluster = envCluster
 	}
+	ECS.CreateCluster(&ecs.CreateClusterInput{
+		ClusterName: aws.String(Cluster),
+	})
 }
 
 // GetTaskDefinition is a helper that provies the family:revision for the named
@@ -99,9 +115,16 @@ type TestAgent struct {
 	ContainerInstanceArn string
 	Cluster              string
 	TestDir              string
+	Logdir               string
+	Options              *AgentOptions
 
 	DockerClient *docker.Client
 	t            *testing.T
+}
+
+type AgentOptions struct {
+	ExtraEnvironment map[string]string
+	ContainerLinks   []string
 }
 
 // RunAgent launches the agent and returns an object which may be used to reference it.
@@ -110,18 +133,15 @@ type TestAgent struct {
 // tag that may be used to run the agent. It defaults to
 // 'amazon/amazon-ecs-agent:make', the version created locally by running
 // 'make'
-func RunAgent(t *testing.T, version *string) *TestAgent {
+func RunAgent(t *testing.T, options *AgentOptions) *TestAgent {
 	agent := &TestAgent{t: t}
 	agentImage := "amazon/amazon-ecs-agent:make"
 	if envImage := os.Getenv("ECS_AGENT_IMAGE"); envImage != "" {
 		agentImage = envImage
 	}
-	if version != nil {
-		agentImage = *version
-	}
 	agent.Image = agentImage
 
-	dockerClient, err := docker.NewClient("unix:///var/run/docker.sock")
+	dockerClient, err := docker.NewClientFromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +154,10 @@ func RunAgent(t *testing.T, version *string) *TestAgent {
 			t.Fatal("Could not launch agent", err)
 		}
 	}
-	agentTempdir, err := ioutil.TempDir("", "ecs_integ_testdata")
+
+	tmpdirOverride := os.Getenv("ECS_FTEST_TMP")
+
+	agentTempdir, err := ioutil.TempDir(tmpdirOverride, "ecs_integ_testdata")
 	if err != nil {
 		t.Fatal("Could not create temp dir for test")
 	}
@@ -143,6 +166,10 @@ func RunAgent(t *testing.T, version *string) *TestAgent {
 	os.Mkdir(logdir, 0755)
 	os.Mkdir(datadir, 0755)
 	agent.TestDir = agentTempdir
+	agent.Options = options
+	if options == nil {
+		agent.Options = &AgentOptions{}
+	}
 	t.Logf("Created directory %s to store test data in", agentTempdir)
 	err = agent.StartAgent()
 	if err != nil {
@@ -159,29 +186,48 @@ func (agent *TestAgent) StartAgent() error {
 	agent.t.Logf("Launching agent with image: %s\n", agent.Image)
 	logdir := filepath.Join(agent.TestDir, "logs")
 	datadir := filepath.Join(agent.TestDir, "data")
+	agent.Logdir = logdir
+
+	dockerConfig := &docker.Config{
+		Image: agent.Image,
+		ExposedPorts: map[docker.Port]struct{}{
+			"51678/tcp": struct{}{},
+		},
+		Env: []string{
+			"ECS_CLUSTER=" + Cluster,
+			"ECS_DATADIR=/data",
+			"ECS_LOGLEVEL=debug",
+			"ECS_LOGFILE=/logs/integ_agent.log",
+			"ECS_BACKEND_HOST=" + os.Getenv("ECS_BACKEND_HOST"),
+			"AWS_ACCESS_KEY_ID=" + os.Getenv("AWS_ACCESS_KEY_ID"),
+			"AWS_DEFAULT_REGION=" + *ECS.Config.Region,
+			"AWS_SECRET_ACCESS_KEY=" + os.Getenv("AWS_SECRET_ACCESS_KEY"),
+			"ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION=" + os.Getenv("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION"),
+		},
+		Cmd: strings.Split(os.Getenv("ECS_FTEST_AGENT_ARGS"), " "),
+	}
+
+	hostConfig := &docker.HostConfig{
+		Binds: []string{
+			"/var/run/docker.sock:/var/run/docker.sock",
+			logdir + ":/logs",
+			datadir + ":/data",
+		},
+		PortBindings: map[docker.Port][]docker.PortBinding{
+			"51678/tcp": []docker.PortBinding{docker.PortBinding{HostIP: "0.0.0.0"}},
+		},
+		Links: agent.Options.ContainerLinks,
+	}
+
+	if agent.Options != nil {
+		for key, value := range agent.Options.ExtraEnvironment {
+			dockerConfig.Env = append(dockerConfig.Env, key+"="+value)
+		}
+	}
+
 	agentContainer, err := agent.DockerClient.CreateContainer(docker.CreateContainerOptions{
-		Config: &docker.Config{
-			Image: agent.Image,
-			ExposedPorts: map[docker.Port]struct{}{
-				"51678/tcp": struct{}{},
-			},
-			Env: []string{
-				"ECS_CLUSTER=" + Cluster,
-				"ECS_DATADIR=/data",
-				"ECS_LOGLEVEL=debug",
-				"ECS_LOGFILE=/logs/integ_agent.log",
-			},
-		},
-		HostConfig: &docker.HostConfig{
-			Binds: []string{
-				"/var/run/docker.sock:/var/run/docker.sock",
-				logdir + ":/logs",
-				datadir + ":/data",
-			},
-			PortBindings: map[docker.Port][]docker.PortBinding{
-				"51678/tcp": []docker.PortBinding{docker.PortBinding{HostIP: "0.0.0.0"}},
-			},
-		},
+		Config:     dockerConfig,
+		HostConfig: hostConfig,
 	})
 	if err != nil {
 		agent.t.Fatal("Could not create agent container", err)
@@ -228,8 +274,13 @@ func (agent *TestAgent) StartAgent() error {
 	agent.ContainerInstanceArn = *localMetadata.ContainerInstanceArn
 	agent.Cluster = localMetadata.Cluster
 	if localMetadata.Version != "" {
-		agent.Version = localMetadata.Version
-	} else {
+		versionNumberRegex := regexp.MustCompile(` v(\d+\.\d+\.\d+) `)
+		versionNumberStr := versionNumberRegex.FindStringSubmatch(localMetadata.Version)
+		if len(versionNumberStr) == 2 {
+			agent.Version = string(versionNumberStr[1])
+		}
+	}
+	if agent.Version == "" {
 		agent.Version = "UNKNOWN"
 	}
 	agent.t.Logf("Found agent metadata: %+v", localMetadata)
@@ -238,12 +289,16 @@ func (agent *TestAgent) StartAgent() error {
 
 func (agent *TestAgent) Cleanup() {
 	agent.StopAgent()
-	os.RemoveAll(agent.TestDir)
-	trueval := true
+	if agent.t.Failed() {
+		agent.t.Logf("Preserving test dir for failed test %s", agent.TestDir)
+	} else {
+		agent.t.Logf("Removing test dir for passed test %s", agent.TestDir)
+		os.RemoveAll(agent.TestDir)
+	}
 	ECS.DeregisterContainerInstance(&ecs.DeregisterContainerInstanceInput{
 		Cluster:           &agent.Cluster,
 		ContainerInstance: &agent.ContainerInstanceArn,
-		Force:             &trueval,
+		Force:             aws.Bool(true),
 	})
 }
 
@@ -273,7 +328,7 @@ func (agent *TestAgent) StartMultipleTasks(t *testing.T, task string, num int) (
 
 	testTasks := make([]*TestTask, num)
 	for i, task := range resp.Tasks {
-		agent.t.Logf("Started task: %s\n", *task.TaskARN)
+		agent.t.Logf("Started task: %s\n", *task.TaskArn)
 		testTasks[i] = &TestTask{task}
 	}
 	return testTasks, nil
@@ -309,21 +364,32 @@ func (agent *TestAgent) StartTaskWithOverrides(t *testing.T, task string, overri
 		return nil, errors.New("Failure starting task: " + *resp.Failures[0].Reason)
 	}
 
-	agent.t.Logf("Started task: %s\n", *resp.Tasks[0].TaskARN)
+	agent.t.Logf("Started task: %s\n", *resp.Tasks[0].TaskArn)
 	return &TestTask{resp.Tasks[0]}, nil
 }
 
+// ResolveTaskDockerID determines the Docker ID for a container within a given
+// task that has been run by the Agent.
 func (agent *TestAgent) ResolveTaskDockerID(task *TestTask, containerName string) (string, error) {
-	agentTaskResp, err := http.Get(agent.IntrospectionURL + "/v1/tasks?taskarn=" + *task.TaskARN)
-	if err != nil {
-		return "", err
+	var err error
+	var dockerId string
+	for i := 0; i < 5; i++ {
+		dockerId, err = agent.resolveTaskDockerID(task, containerName)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	bodyData, err := ioutil.ReadAll(agentTaskResp.Body)
+	return dockerId, err
+}
+
+func (agent *TestAgent) resolveTaskDockerID(task *TestTask, containerName string) (string, error) {
+	bodyData, err := agent.callTaskIntrospectionApi(*task.TaskArn)
 	if err != nil {
 		return "", err
 	}
 	var taskResp handlers.TaskResponse
-	err = json.Unmarshal(bodyData, &taskResp)
+	err = json.Unmarshal(*bodyData, &taskResp)
 	if err != nil {
 		return "", err
 	}
@@ -338,14 +404,106 @@ func (agent *TestAgent) ResolveTaskDockerID(task *TestTask, containerName string
 	return "", errors.New("No containers matched given name")
 }
 
+func (agent *TestAgent) WaitStoppedViaIntrospection(task *TestTask) (bool, error) {
+	var err error
+	var isStopped bool
+
+	for i := 0; i < 5; i++ {
+		isStopped, err = agent.waitStoppedViaIntrospection(task)
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return isStopped, err
+}
+
+func (agent *TestAgent) waitStoppedViaIntrospection(task *TestTask) (bool, error) {
+	rawResponse, err := agent.callTaskIntrospectionApi(*task.TaskArn)
+	if err != nil {
+		return false, err
+	}
+
+	var taskResp handlers.TaskResponse
+	err = json.Unmarshal(*rawResponse, &taskResp)
+
+	if taskResp.KnownStatus == "STOPPED" {
+		return true, nil
+	} else {
+		return false, errors.New("Task should be STOPPED but is " + taskResp.KnownStatus)
+	}
+}
+
+func (agent *TestAgent) WaitRunningViaIntrospection(task *TestTask) (bool, error) {
+	var err error
+	var isRunning bool
+
+	for i := 0; i < 5; i++ {
+		isRunning, err = agent.waitRunningViaIntrospection(task)
+		if err == nil && isRunning {
+			break
+		}
+		time.Sleep(10000 * time.Millisecond)
+	}
+	return isRunning, err
+}
+
+func (agent *TestAgent) waitRunningViaIntrospection(task *TestTask) (bool, error) {
+	rawResponse, err := agent.callTaskIntrospectionApi(*task.TaskArn)
+	if err != nil {
+		return false, err
+	}
+
+	var taskResp handlers.TaskResponse
+	err = json.Unmarshal(*rawResponse, &taskResp)
+
+	if taskResp.KnownStatus == "RUNNING" {
+		return true, nil
+	} else {
+		return false, errors.New("Task should be RUNNING but is " + taskResp.KnownStatus)
+	}
+}
+
+func (agent *TestAgent) callTaskIntrospectionApi(taskArn string) (*[]byte, error) {
+	fullIntrospectionApiURL := agent.IntrospectionURL + "/v1/tasks"
+	if taskArn != "" {
+		fullIntrospectionApiURL += "?taskarn=" + taskArn
+	}
+
+	agentTasksResp, err := http.Get(fullIntrospectionApiURL)
+	if err != nil {
+		return nil, err
+	}
+
+	bodyData, err := ioutil.ReadAll(agentTasksResp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return &bodyData, nil
+}
+
+func (agent *TestAgent) RequireVersion(version string) {
+	if agent.Version == "UNKNOWN" {
+		agent.t.Skipf("Skipping test requiring version %v; agent version unknown", version)
+	}
+
+	matches, err := Version(agent.Version).Matches(version)
+	if err != nil {
+		agent.t.Skipf("Skipping test requiring version %v; could not compare because of error: %v", version, err)
+	}
+	if !matches {
+		agent.t.Skipf("Skipping test requiring version %v; agent version %v", version, agent.Version)
+	}
+}
+
 type TestTask struct {
 	*ecs.Task
 }
 
 func (task *TestTask) Redescribe() {
 	res, err := ECS.DescribeTasks(&ecs.DescribeTasksInput{
-		Cluster: task.ClusterARN,
-		Tasks:   []*string{task.TaskARN},
+		Cluster: task.ClusterArn,
+		Tasks:   []*string{task.TaskArn},
 	})
 	if err == nil && len(res.Failures) == 0 {
 		task.Task = res.Tasks[0]
@@ -381,7 +539,7 @@ func (task *TestTask) waitStatus(timeout time.Duration, status string) error {
 		return err
 	case <-timer.C:
 		cancelled = true
-		return errors.New("Timed out waiting for task to reach" + status + ": " + *task.TaskDefinitionARN + ", " + *task.TaskARN)
+		return errors.New("Timed out waiting for task to reach " + status + ": " + *task.TaskDefinitionArn + ", " + *task.TaskArn)
 	}
 }
 
@@ -423,13 +581,35 @@ func (task *TestTask) ExpectErrorType(containerName, errType string, timeout tim
 		}
 		return nil
 	}
-	return errors.New("Could not find container " + containerName + " in task " + *task.TaskARN)
+	return errors.New("Could not find container " + containerName + " in task " + *task.TaskArn)
 }
 
 func (task *TestTask) Stop() error {
 	_, err := ECS.StopTask(&ecs.StopTaskInput{
-		Cluster: task.ClusterARN,
-		Task:    task.TaskARN,
+		Cluster: task.ClusterArn,
+		Task:    task.TaskArn,
 	})
 	return err
+}
+
+func RequireDockerVersion(t *testing.T, selector string) {
+	dockerClient, err := docker.NewClientFromEnv()
+	if err != nil {
+		t.Fatalf("Could not get docker client to check version: %v", err)
+	}
+	dockerVersion, err := dockerClient.Version()
+	if err != nil {
+		t.Fatalf("Could not get docker version: %v", err)
+	}
+
+	version := dockerVersion.Get("Version")
+
+	match, err := Version(version).Matches(selector)
+	if err != nil {
+		t.Fatalf("Could not check docker version to match required: %v", err)
+	}
+
+	if !match {
+		t.Skipf("Skipping test; requires %v, but version is %v", selector, version)
+	}
 }

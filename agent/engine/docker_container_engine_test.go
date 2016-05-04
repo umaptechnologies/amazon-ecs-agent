@@ -14,6 +14,7 @@
 package engine
 
 import (
+	"encoding/base64"
 	"errors"
 	"io"
 	"reflect"
@@ -22,25 +23,35 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
+	docker "github.com/fsouza/go-dockerclient"
+	"github.com/golang/mock/gomock"
 	"golang.org/x/net/context"
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
+	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/ecr/mocks"
+	ecrapi "github.com/aws/amazon-ecs-agent/agent/ecr/model/ecr"
+	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient/mocks"
+	"github.com/aws/amazon-ecs-agent/agent/engine/dockeriface/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
-	docker "github.com/fsouza/go-dockerclient"
-
-	"github.com/golang/mock/gomock"
 )
 
-func dockerclientSetup(t *testing.T) (*mock_dockerclient.MockClient, *DockerGoClient, *ttime.TestTime, func()) {
+func dockerclientSetup(t *testing.T) (*mock_dockeriface.MockClient, *dockerGoClient, *ttime.TestTime, func()) {
 	ctrl := gomock.NewController(t)
-	mockDocker := mock_dockerclient.NewMockClient(ctrl)
-	client := &DockerGoClient{}
-	client.SetGoDockerClient(mockDocker)
+	mockDocker := mock_dockeriface.NewMockClient(ctrl)
+	mockDocker.EXPECT().Ping().AnyTimes().Return(nil)
+	factory := mock_dockerclient.NewMockFactory(ctrl)
+	factory.EXPECT().GetDefaultClient().AnyTimes().Return(mockDocker, nil)
+	client, _ := NewDockerGoClient(factory, "", config.NewSensitiveRawMessage([]byte{}), false)
+	goClient, _ := client.(*dockerGoClient)
+	ecrClientFactory := mock_ecr.NewMockECRFactory(ctrl)
+	goClient.ecrClientFactory = ecrClientFactory
 	testTime := ttime.NewTestTime()
 	ttime.SetTime(testTime)
-	return mockDocker, client, testTime, ctrl.Finish
+	return mockDocker, goClient, testTime, ctrl.Finish
 }
 
 type pullImageOptsMatcher struct {
@@ -67,7 +78,7 @@ func TestPullImageOutputTimeout(t *testing.T) {
 		// Don't return, verify timeout happens
 	})
 
-	metadata := client.PullImage("image")
+	metadata := client.PullImage("image", nil)
 	if metadata.Error == nil {
 		t.Error("Expected error for pull timeout")
 	}
@@ -96,7 +107,7 @@ func TestPullImageGlobalTimeout(t *testing.T) {
 		// Don't return, verify timeout happens
 	})
 
-	metadata := client.PullImage("image")
+	metadata := client.PullImage("image", nil)
 	if metadata.Error == nil {
 		t.Error("Expected error for pull timeout")
 	}
@@ -105,7 +116,7 @@ func TestPullImageGlobalTimeout(t *testing.T) {
 	}
 
 	mockDocker.EXPECT().PullImage(&pullImageOptsMatcher{"image2:latest"}, gomock.Any())
-	_ = client.PullImage("image2")
+	_ = client.PullImage("image2", nil)
 
 	// cleanup
 	wait.Done()
@@ -117,7 +128,34 @@ func TestPullImage(t *testing.T) {
 
 	mockDocker.EXPECT().PullImage(&pullImageOptsMatcher{"image:latest"}, gomock.Any()).Return(nil)
 
-	metadata := client.PullImage("image")
+	metadata := client.PullImage("image", nil)
+	if metadata.Error != nil {
+		t.Error("Expected pull to succeed")
+	}
+}
+
+func TestPullImageTag(t *testing.T) {
+	mockDocker, client, _, done := dockerclientSetup(t)
+	defer done()
+
+	mockDocker.EXPECT().PullImage(&pullImageOptsMatcher{"image:mytag"}, gomock.Any()).Return(nil)
+
+	metadata := client.PullImage("image:mytag", nil)
+	if metadata.Error != nil {
+		t.Error("Expected pull to succeed")
+	}
+}
+
+func TestPullImageDigest(t *testing.T) {
+	mockDocker, client, _, done := dockerclientSetup(t)
+	defer done()
+
+	mockDocker.EXPECT().PullImage(
+		&pullImageOptsMatcher{"image@sha256:bc8813ea7b3603864987522f02a76101c17ad122e1c46d790efc0fca78ca7bfb"},
+		gomock.Any(),
+	).Return(nil)
+
+	metadata := client.PullImage("image@sha256:bc8813ea7b3603864987522f02a76101c17ad122e1c46d790efc0fca78ca7bfb", nil)
 	if metadata.Error != nil {
 		t.Error("Expected pull to succeed")
 	}
@@ -142,7 +180,7 @@ func TestPullEmptyvolumeImage(t *testing.T) {
 		}),
 	)
 
-	metadata := client.PullImage(emptyvolume.Image + ":" + emptyvolume.Tag)
+	metadata := client.PullImage(emptyvolume.Image+":"+emptyvolume.Tag, nil)
 	if metadata.Error != nil {
 		t.Error(metadata.Error)
 	}
@@ -157,9 +195,108 @@ func TestPullExistingEmptyvolumeImage(t *testing.T) {
 		mockDocker.EXPECT().InspectImage(emptyvolume.Image+":"+emptyvolume.Tag).Return(&docker.Image{}, nil),
 	)
 
-	metadata := client.PullImage(emptyvolume.Image + ":" + emptyvolume.Tag)
+	metadata := client.PullImage(emptyvolume.Image+":"+emptyvolume.Tag, nil)
 	if metadata.Error != nil {
 		t.Error(metadata.Error)
+	}
+}
+
+func TestPullImageECRSuccess(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockDocker := mock_dockeriface.NewMockClient(ctrl)
+	mockDocker.EXPECT().Ping().AnyTimes().Return(nil)
+	factory := mock_dockerclient.NewMockFactory(ctrl)
+	factory.EXPECT().GetDefaultClient().AnyTimes().Return(mockDocker, nil)
+	client, _ := NewDockerGoClient(factory, "", config.NewSensitiveRawMessage([]byte{}), false)
+	goClient, _ := client.(*dockerGoClient)
+	ecrClientFactory := mock_ecr.NewMockECRFactory(ctrl)
+	ecrClient := mock_ecr.NewMockECRSDK(ctrl)
+	goClient.ecrClientFactory = ecrClientFactory
+	testTime := ttime.NewTestTime()
+	ttime.SetTime(testTime)
+
+	registryId := "123456789012"
+	region := "eu-west-1"
+	endpointOverride := "my.endpoint"
+	authData := &api.RegistryAuthenticationData{
+		Type: "ecr",
+		ECRAuthData: &api.ECRAuthData{
+			RegistryId:       registryId,
+			Region:           region,
+			EndpointOverride: endpointOverride,
+		},
+	}
+	imageEndpoint := "registry.endpoint"
+	image := imageEndpoint + "/myimage:tag"
+	username := "username"
+	password := "password"
+	dockerAuthConfiguration := docker.AuthConfiguration{
+		Username:      username,
+		Password:      password,
+		ServerAddress: "https://" + imageEndpoint,
+	}
+	getAuthorizationTokenInput := &ecrapi.GetAuthorizationTokenInput{
+		RegistryIds: []*string{aws.String(registryId)},
+	}
+
+	ecrClientFactory.EXPECT().GetClient(region, endpointOverride).Return(ecrClient)
+	ecrClient.EXPECT().GetAuthorizationToken(getAuthorizationTokenInput).Return(
+		&ecrapi.GetAuthorizationTokenOutput{
+			AuthorizationData: []*ecrapi.AuthorizationData{
+				&ecrapi.AuthorizationData{
+					ProxyEndpoint:      aws.String("https://" + imageEndpoint),
+					AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
+				},
+			},
+		}, nil)
+
+	mockDocker.EXPECT().PullImage(
+		&pullImageOptsMatcher{image},
+		dockerAuthConfiguration,
+	).Return(nil)
+
+	metadata := client.PullImage(image, authData)
+	if metadata.Error != nil {
+		t.Error("Expected pull to succeed")
+	}
+}
+
+func TestPullImageECRAuthFail(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockDocker := mock_dockeriface.NewMockClient(ctrl)
+	mockDocker.EXPECT().Ping().AnyTimes().Return(nil)
+	factory := mock_dockerclient.NewMockFactory(ctrl)
+	factory.EXPECT().GetDefaultClient().AnyTimes().Return(mockDocker, nil)
+	client, _ := NewDockerGoClient(factory, "", config.NewSensitiveRawMessage([]byte{}), false)
+	goClient, _ := client.(*dockerGoClient)
+	ecrClientFactory := mock_ecr.NewMockECRFactory(ctrl)
+	ecrClient := mock_ecr.NewMockECRSDK(ctrl)
+	goClient.ecrClientFactory = ecrClientFactory
+	testTime := ttime.NewTestTime()
+	ttime.SetTime(testTime)
+
+	registryId := "123456789012"
+	region := "eu-west-1"
+	endpointOverride := "my.endpoint"
+	authData := &api.RegistryAuthenticationData{
+		Type: "ecr",
+		ECRAuthData: &api.ECRAuthData{
+			RegistryId:       registryId,
+			Region:           region,
+			EndpointOverride: endpointOverride,
+		},
+	}
+	imageEndpoint := "registry.endpoint"
+	image := imageEndpoint + "/myimage:tag"
+
+	ecrClientFactory.EXPECT().GetClient(region, endpointOverride).Return(ecrClient)
+	ecrClient.EXPECT().GetAuthorizationToken(gomock.Any()).Return(&ecrapi.GetAuthorizationTokenOutput{}, errors.New("test error"))
+
+	metadata := client.PullImage(image, authData)
+	if metadata.Error == nil {
+		t.Error("Expected pull to fail")
 	}
 }
 
@@ -185,6 +322,30 @@ func TestCreateContainerTimeout(t *testing.T) {
 	wait.Done()
 }
 
+func TestCreateContainerInspectTimeout(t *testing.T) {
+	mockDocker, client, testTime, done := dockerclientSetup(t)
+	defer done()
+
+	wait := &sync.WaitGroup{}
+	wait.Add(1)
+	config := docker.CreateContainerOptions{Config: &docker.Config{Memory: 100}, Name: "containerName"}
+	gomock.InOrder(
+		mockDocker.EXPECT().CreateContainer(config).Return(&docker.Container{ID: "id"}, nil),
+		mockDocker.EXPECT().InspectContainer("id").Do(func(x interface{}) {
+			testTime.Warp(inspectContainerTimeout)
+			wait.Wait()
+		}),
+	)
+	metadata := client.CreateContainer(config.Config, nil, config.Name)
+	if metadata.DockerId != "id" {
+		t.Error("Expected ID to be set even if inspect failed; was " + metadata.DockerId)
+	}
+	if metadata.Error == nil {
+		t.Error("Expected error for inspect timeout")
+	}
+	wait.Done()
+}
+
 func TestCreateContainer(t *testing.T) {
 	mockDocker, client, _, done := dockerclientSetup(t)
 	defer done()
@@ -200,6 +361,9 @@ func TestCreateContainer(t *testing.T) {
 	}
 	if metadata.DockerId != "id" {
 		t.Error("Wrong id")
+	}
+	if metadata.ExitCode != nil {
+		t.Error("Expected a created container to not have an exit code")
 	}
 }
 
@@ -371,11 +535,12 @@ func TestContainerEvents(t *testing.T) {
 		t.Error("Incorrect volume mapping")
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 2; i++ {
 		stoppedContainer := &docker.Container{
 			ID: "cid3" + strconv.Itoa(i),
 			State: docker.State{
-				ExitCode: 20,
+				FinishedAt: time.Now(),
+				ExitCode:   20,
 			},
 		}
 		mockDocker.EXPECT().InspectContainer("cid3"+strconv.Itoa(i)).Return(stoppedContainer, nil)
@@ -383,10 +548,9 @@ func TestContainerEvents(t *testing.T) {
 	go func() {
 		events <- &docker.APIEvents{ID: "cid30", Status: "stop"}
 		events <- &docker.APIEvents{ID: "cid31", Status: "die"}
-		events <- &docker.APIEvents{ID: "cid32", Status: "kill"}
 	}()
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 2; i++ {
 		anEvent := <-dockerEvents
 		if anEvent.DockerId != "cid3"+strconv.Itoa(i) {
 			t.Error("Wrong container id: " + anEvent.DockerId)
@@ -400,7 +564,30 @@ func TestContainerEvents(t *testing.T) {
 	}
 
 	// Verify the following events do not translate into our event stream
-	for _, eventStatus := range []string{"pause", "export", "pull", "untag", "delete"} {
+
+	//
+	// Docker 1.8.3 sends the full command appended to exec_create and exec_start
+	// events. Test that we ignore there as well..
+	//
+	ignore := []string{
+		"pause",
+		"exec_create",
+		"exec_create: /bin/bash",
+		"exec_start",
+		"exec_start: /bin/bash",
+		"top",
+		"attach",
+		"export",
+		"pull",
+		"push",
+		"tag",
+		"untag",
+		"import",
+		"delete",
+		"oom",
+		"kill",
+	}
+	for _, eventStatus := range ignore {
 		events <- &docker.APIEvents{ID: "123", Status: eventStatus}
 		select {
 		case <-dockerEvents:
@@ -465,4 +652,68 @@ func TestListImagesTimeout(t *testing.T) {
 		t.Error("Wrong error type")
 	}
 	wait.Done()
+}
+
+func TestPingFailError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockDocker := mock_dockeriface.NewMockClient(ctrl)
+	mockDocker.EXPECT().Ping().Return(errors.New("err"))
+	factory := mock_dockerclient.NewMockFactory(ctrl)
+	factory.EXPECT().GetDefaultClient().Return(mockDocker, nil)
+	_, err := NewDockerGoClient(factory, "", config.NewSensitiveRawMessage([]byte{}), false)
+	if err == nil {
+		t.Fatal("Expected ping error to result in constructor fail")
+	}
+}
+
+func TestUsesVersionedClient(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockDocker := mock_dockeriface.NewMockClient(ctrl)
+	mockDocker.EXPECT().Ping().Return(nil)
+	factory := mock_dockerclient.NewMockFactory(ctrl)
+	factory.EXPECT().GetDefaultClient().Return(mockDocker, nil)
+	client, err := NewDockerGoClient(factory, "", config.NewSensitiveRawMessage([]byte{}), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vclient := client.WithVersion(dockerclient.DockerVersion("1.20"))
+
+	factory.EXPECT().GetClient(dockerclient.DockerVersion("1.20")).Times(2).Return(mockDocker, nil)
+	mockDocker.EXPECT().StartContainer(gomock.Any(), gomock.Any()).Return(nil)
+	mockDocker.EXPECT().InspectContainer(gomock.Any()).Return(nil, errors.New("err"))
+
+	vclient.StartContainer("foo")
+}
+
+func TestUnavailableVersionError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	mockDocker := mock_dockeriface.NewMockClient(ctrl)
+	mockDocker.EXPECT().Ping().Return(nil)
+	factory := mock_dockerclient.NewMockFactory(ctrl)
+	factory.EXPECT().GetDefaultClient().Return(mockDocker, nil)
+	client, err := NewDockerGoClient(factory, "", config.NewSensitiveRawMessage([]byte{}), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vclient := client.WithVersion(dockerclient.DockerVersion("1.21"))
+
+	factory.EXPECT().GetClient(dockerclient.DockerVersion("1.21")).Times(1).Return(nil, errors.New("Cannot get client"))
+
+	metadata := vclient.StartContainer("foo")
+
+	if metadata.Error == nil {
+		t.Fatal("Expected error, didn't get one")
+	}
+	if namederr, ok := metadata.Error.(api.NamedError); ok {
+		if namederr.ErrorName() != "CannotGetDockerclientError" {
+			t.Fatal("Wrong error name, expected CannotGetDockerclientError but got " + namederr.ErrorName())
+		}
+	} else {
+		t.Fatal("Error was not a named error")
+	}
 }

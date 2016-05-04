@@ -199,7 +199,7 @@ func (t *TaskStateChange) String() string {
 }
 
 func (t *Task) String() string {
-	res := fmt.Sprintf("%s-%s %s, Status: (%s->%s)", t.Family, t.Version, t.Arn, t.KnownStatus.String(), t.DesiredStatus.String())
+	res := fmt.Sprintf("%s:%s %s, Status: (%s->%s)", t.Family, t.Version, t.Arn, t.KnownStatus.String(), t.DesiredStatus.String())
 	res += " Containers: ["
 	for _, c := range t.Containers {
 		res += fmt.Sprintf("%s (%s->%s),", c.Name, c.KnownStatus.String(), c.DesiredStatus.String())
@@ -212,19 +212,21 @@ type ContainerOverrides struct {
 }
 
 type Container struct {
-	Name        string
-	Image       string
-	Command     []string
-	Cpu         uint
-	Memory      uint
-	Links       []string
-	VolumesFrom []VolumeFrom  `json:"volumesFrom"`
-	MountPoints []MountPoint  `json:"mountPoints"`
-	Ports       []PortBinding `json:"portMappings"`
-	Essential   bool
-	EntryPoint  *[]string
-	Environment map[string]string  `json:"environment"`
-	Overrides   ContainerOverrides `json:"overrides"`
+	Name                   string
+	Image                  string
+	Command                []string
+	Cpu                    uint
+	Memory                 uint
+	Links                  []string
+	VolumesFrom            []VolumeFrom  `json:"volumesFrom"`
+	MountPoints            []MountPoint  `json:"mountPoints"`
+	Ports                  []PortBinding `json:"portMappings"`
+	Essential              bool
+	EntryPoint             *[]string
+	Environment            map[string]string           `json:"environment"`
+	Overrides              ContainerOverrides          `json:"overrides"`
+	DockerConfig           DockerConfig                `json:"dockerConfig"`
+	RegistryAuthentication *RegistryAuthenticationData `json:"registryAuthentication"`
 
 	DesiredStatus ContainerStatus `json:"desiredStatus"`
 	KnownStatus   ContainerStatus
@@ -249,14 +251,34 @@ type Container struct {
 	StatusLock sync.Mutex
 }
 
+// DockerConfig represents additional metadata about a container to run. It's
+// remodeled from the `ecsacs` api model file. Eventually it should not exist
+// once this remodeling is refactored out.
+type DockerConfig struct {
+	Config     *string `json:"config"`
+	HostConfig *string `json:"hostConfig"`
+	Version    *string `json:"version"`
+}
+
 // VolumeFrom is a volume which references another container as its source.
 type VolumeFrom struct {
 	SourceContainer string `json:"sourceContainer"`
 	ReadOnly        bool   `json:"readOnly"`
 }
 
+type RegistryAuthenticationData struct {
+	Type        string       `json:"type"`
+	ECRAuthData *ECRAuthData `json:"ecrAuthData"`
+}
+
+type ECRAuthData struct {
+	EndpointOverride string `json:"endpointOverride"`
+	Region           string `json:"region"`
+	RegistryId       string `json:"registryId"`
+}
+
 func (c *Container) String() string {
-	ret := fmt.Sprintf("%s-%s (%s->%s)", c.Name, c.Image, c.KnownStatus.String(), c.DesiredStatus.String())
+	ret := fmt.Sprintf("%s(%s) (%s->%s)", c.Name, c.Image, c.KnownStatus.String(), c.DesiredStatus.String())
 	if c.KnownExitCode != nil {
 		ret += " - Exit: " + strconv.Itoa(*c.KnownExitCode)
 	}

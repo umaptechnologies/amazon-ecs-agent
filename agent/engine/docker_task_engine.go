@@ -24,22 +24,30 @@ import (
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/config"
-	"github.com/aws/amazon-ecs-agent/agent/engine/dockerauth"
+	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	utilsync "github.com/aws/amazon-ecs-agent/agent/utils/sync"
+	"github.com/cihub/seelog"
 )
 
 const (
 	DOCKER_ENDPOINT_ENV_VARIABLE = "DOCKER_HOST"
 	DOCKER_DEFAULT_ENDPOINT      = "unix:///var/run/docker.sock"
+	capabilityPrefix             = "com.amazonaws.ecs.capability."
 )
 
 // The DockerTaskEngine interacts with docker to implement a task
 // engine
 type DockerTaskEngine struct {
 	// implements TaskEngine
+
+	cfg                *config.Config
+	acceptInsecureCert bool
+
+	initialized  bool
+	mustInitLock sync.Mutex
 
 	// state stores all tasks this task engine is aware of, including their
 	// current state and mappings to/from dockerId and name.
@@ -55,7 +63,8 @@ type DockerTaskEngine struct {
 	taskEvents      chan api.TaskStateChange
 	saver           statemanager.Saver
 
-	client DockerClient
+	client     DockerClient
+	clientLock sync.Mutex
 
 	stopEngine context.CancelFunc
 
@@ -70,10 +79,12 @@ type DockerTaskEngine struct {
 // The distinction between created and initialized is that when created it may
 // be serialized/deserialized, but it will not communicate with docker until it
 // is also initialized.
-func NewDockerTaskEngine(cfg *config.Config) *DockerTaskEngine {
+func NewDockerTaskEngine(cfg *config.Config, acceptInsecureCert bool) *DockerTaskEngine {
 	dockerTaskEngine := &DockerTaskEngine{
-		client: nil,
-		saver:  statemanager.NewNoopStateManager(),
+		cfg:                cfg,
+		acceptInsecureCert: acceptInsecureCert,
+		client:             nil,
+		saver:              statemanager.NewNoopStateManager(),
 
 		state:         dockerstate.NewDockerTaskEngineState(),
 		managedTasks:  make(map[string]*managedTask),
@@ -82,7 +93,6 @@ func NewDockerTaskEngine(cfg *config.Config) *DockerTaskEngine {
 		containerEvents: make(chan api.ContainerStateChange),
 		taskEvents:      make(chan api.TaskStateChange),
 	}
-	dockerauth.SetConfig(cfg)
 
 	return dockerTaskEngine
 }
@@ -119,35 +129,50 @@ func (engine *DockerTaskEngine) Init() error {
 	engine.synchronizeState()
 	// Now catch up and start processing new events per normal
 	go engine.handleDockerEvents(ctx)
-
+	engine.initialized = true
 	return nil
 }
 
 func (engine *DockerTaskEngine) initDockerClient() error {
-	if engine.client == nil {
-		client, err := NewDockerGoClient()
-		if err != nil {
-			return err
-		}
-		engine.client = client
+	if engine.client != nil {
+		return nil
 	}
+
+	engine.clientLock.Lock()
+	defer engine.clientLock.Unlock()
+	if engine.client != nil {
+		return nil
+	}
+	client, err := NewDockerGoClient(nil, engine.cfg.EngineAuthType, engine.cfg.EngineAuthData, engine.acceptInsecureCert)
+	if err != nil {
+		return err
+	}
+	engine.client = client
+
 	return nil
 }
 
 // SetDockerClient provides a way to override the client used for communication with docker as a testing hook.
 func (engine *DockerTaskEngine) SetDockerClient(client DockerClient) {
+	engine.clientLock.Lock()
+	engine.clientLock.Unlock()
 	engine.client = client
 }
 
 // MustInit blocks and retries until an engine can be initialized.
 func (engine *DockerTaskEngine) MustInit() {
-	if engine.client != nil {
+	if engine.initialized {
 		return
 	}
+	engine.mustInitLock.Lock()
+	defer engine.mustInitLock.Unlock()
 
 	errorOnce := sync.Once{}
 	taskEngineConnectBackoff := utils.NewSimpleBackoff(200*time.Millisecond, 2*time.Second, 0.20, 1.5)
 	utils.RetryWithBackoff(taskEngineConnectBackoff, func() error {
+		if engine.initialized {
+			return nil
+		}
 		err := engine.Init()
 		if err != nil {
 			errorOnce.Do(func() {
@@ -351,13 +376,14 @@ func (engine *DockerTaskEngine) handleDockerEvents(ctx context.Context) {
 			}
 			engine.processTasks.RLock()
 			managedTask, ok := engine.managedTasks[task.Arn]
+			engine.processTasks.RUnlock()
 			if !ok {
 				log.Crit("Could not find managed task corresponding to a docker event", "event", event, "task", task)
+				continue
 			}
 			log.Debug("Writing docker event to the associated task", "task", task, "event", event)
 			managedTask.dockerMessages <- dockerContainerChange{container: cont.Container, event: event}
 			log.Debug("Wrote docker event to the associated task", "task", task, "event", event)
-			engine.processTasks.RUnlock()
 		}
 	}
 }
@@ -396,14 +422,21 @@ func (engine *DockerTaskEngine) ListTasks() ([]*api.Task, error) {
 	return engine.state.AllTasks(), nil
 }
 
+func (engine *DockerTaskEngine) GetTaskByArn(arn string) (*api.Task, bool) {
+	return engine.state.TaskByArn(arn)
+}
+
 func (engine *DockerTaskEngine) pullContainer(task *api.Task, container *api.Container) DockerContainerMetadata {
 	log.Info("Pulling container", "task", task, "container", container)
-
-	return engine.client.PullImage(container.Image)
+	return engine.client.PullImage(container.Image, container.RegistryAuthentication)
 }
 
 func (engine *DockerTaskEngine) createContainer(task *api.Task, container *api.Container) DockerContainerMetadata {
 	log.Info("Creating container", "task", task, "container", container)
+	client := engine.client
+	if container.DockerConfig.Version != nil {
+		client = client.WithVersion(dockerclient.DockerVersion(*container.DockerConfig.Version))
+	}
 
 	// Resolve HostConfig
 	// we have to do this in create, not start, because docker no longer handles
@@ -440,18 +473,24 @@ func (engine *DockerTaskEngine) createContainer(task *api.Task, container *api.C
 	// we die before 'createContainer' returns because we can inspect by
 	// name
 	engine.state.AddContainer(&api.DockerContainer{DockerName: containerName, Container: container}, task)
+	seelog.Infof("Created container name mapping for task %s - %s -> %s", task, container, containerName)
+	engine.saver.ForceSave()
 
-	metadata := engine.client.CreateContainer(config, hostConfig, containerName)
-	if metadata.Error != nil {
-		return metadata
+	metadata := client.CreateContainer(config, hostConfig, containerName)
+	if metadata.DockerId != "" {
+		engine.state.AddContainer(&api.DockerContainer{DockerId: metadata.DockerId, DockerName: containerName, Container: container}, task)
 	}
-	engine.state.AddContainer(&api.DockerContainer{DockerId: metadata.DockerId, DockerName: containerName, Container: container}, task)
-	log.Info("Created container successfully", "task", task, "container", container)
+	seelog.Infof("Created docker container for task %s: %s -> %s", task, container, metadata.DockerId)
 	return metadata
 }
 
 func (engine *DockerTaskEngine) startContainer(task *api.Task, container *api.Container) DockerContainerMetadata {
 	log.Info("Starting container", "task", task, "container", container)
+	client := engine.client
+	if container.DockerConfig.Version != nil {
+		client = client.WithVersion(dockerclient.DockerVersion(*container.DockerConfig.Version))
+	}
+
 	containerMap, ok := engine.state.ContainerMapByArn(task.Arn)
 	if !ok {
 		return DockerContainerMetadata{Error: CannotXContainerError{"Start", "Container belongs to unrecognized task " + task.Arn}}
@@ -461,7 +500,7 @@ func (engine *DockerTaskEngine) startContainer(task *api.Task, container *api.Co
 	if !ok {
 		return DockerContainerMetadata{Error: CannotXContainerError{"Start", "Container not recorded as created"}}
 	}
-	return engine.client.StartContainer(dockerContainer.DockerId)
+	return client.StartContainer(dockerContainer.DockerId)
 }
 
 func (engine *DockerTaskEngine) stopContainer(task *api.Task, container *api.Container) DockerContainerMetadata {
@@ -571,6 +610,57 @@ func (engine *DockerTaskEngine) transitionContainer(task *api.Task, container *a
 // It returns an internal representation of the state of this DockerTaskEngine.
 func (engine *DockerTaskEngine) State() *dockerstate.DockerTaskEngineState {
 	return engine.state
+}
+
+// Capabilities returns the supported capabilities of this agent / docker-client pair.
+// Currently, the following capabilities are possible:
+//
+//    com.amazonaws.ecs.capability.privileged-container
+//    com.amazonaws.ecs.capability.docker-remote-api.1.17
+//    com.amazonaws.ecs.capability.docker-remote-api.1.18
+//    com.amazonaws.ecs.capability.docker-remote-api.1.19
+//    com.amazonaws.ecs.capability.docker-remote-api.1.20
+//    com.amazonaws.ecs.capability.logging-driver.json-file
+//    com.amazonaws.ecs.capability.logging-driver.syslog
+//    com.amazonaws.ecs.capability.logging-driver.fluentd
+//    com.amazonaws.ecs.capability.logging-driver.journald
+//    com.amazonaws.ecs.capability.logging-driver.gelf
+//    com.amazonaws.ecs.capability.selinux
+//    com.amazonaws.ecs.capability.apparmor
+func (engine *DockerTaskEngine) Capabilities() []string {
+	err := engine.initDockerClient()
+	if err != nil {
+		return nil
+	}
+	capabilities := []string{}
+	if !engine.cfg.PrivilegedDisabled {
+		capabilities = append(capabilities, capabilityPrefix+"privileged-container")
+	}
+	versions := make(map[dockerclient.DockerVersion]bool)
+	for _, version := range engine.client.SupportedVersions() {
+		capabilities = append(capabilities, capabilityPrefix+"docker-remote-api."+string(version))
+		versions[version] = true
+	}
+
+	for _, loggingDriver := range engine.cfg.AvailableLoggingDrivers {
+		requiredVersion := dockerclient.LoggingDriverMinimumVersion[loggingDriver]
+		if _, ok := versions[requiredVersion]; ok {
+			capabilities = append(capabilities, capabilityPrefix+"logging-driver."+string(loggingDriver))
+		}
+	}
+
+	if engine.cfg.SELinuxCapable {
+		capabilities = append(capabilities, capabilityPrefix+"selinux")
+	}
+	if engine.cfg.AppArmorCapable {
+		capabilities = append(capabilities, capabilityPrefix+"apparmor")
+	}
+
+	if _, ok := versions[dockerclient.Version_1_19]; ok {
+		capabilities = append(capabilities, capabilityPrefix+"ecr-auth")
+	}
+
+	return capabilities
 }
 
 // Version returns the underlying docker version.

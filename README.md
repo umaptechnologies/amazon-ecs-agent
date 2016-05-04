@@ -2,25 +2,42 @@
 
 [![Build Status](https://travis-ci.org/aws/amazon-ecs-agent.svg?branch=master)](https://travis-ci.org/aws/amazon-ecs-agent)
 
-The Amazon ECS Container Agent is software developed for the [Amazon EC2 Container Service](http://aws.amazon.com/ecs/).
+The Amazon ECS Container Agent is software developed for Amazon EC2 Container Service ([Amazon ECS](http://aws.amazon.com/ecs/)).
 
 It runs on Container Instances and starts containers on behalf of Amazon ECS.
 
-## Basic Usage
+## Usage
 
-### Docker Image
+The best source of information on running this software is the [AWS Documentation](http://docs.aws.amazon.com/AmazonECS/latest/developerguide/ECS_agent.html).
 
-The Amazon ECS Container Agent should be run in a docker container and may be
-downloaded from our [Docker Hub
-Repository](https://registry.hub.docker.com/u/amazon/amazon-ecs-agent/).
-Documentation on running it properly may be found on the Repository page.
+### On the Amazon Linux AMI
 
-tl;dr: *On an Amazon ECS Container Instance*
+On the [Amazon Linux AMI](https://aws.amazon.com/amazon-linux-ami/), we provide an init package which can be used via `sudo yum install ecs-init && sudo start ecs`. This is the recommended way to run it in this environment.
 
-1. `touch /etc/ecs/ecs.config`
-2. `mkdir -p /var/log/ecs`
-3. `docker run --name ecs-agent -d -v /var/run/docker.sock:/var/run/docker.sock -v /var/log/ecs:/log -v /var/lib/ecs/data:/data -p
-127.0.0.1:51678:51678 --env-file /etc/ecs/ecs.config -e ECS_LOGFILE=/log/ecs-agent.log -e ECS_DATADIR=/data/ amazon/amazon-ecs-agent`
+### On Other AMIs
+
+The Amazon ECS Container Agent may also be run in a Docker container on an EC2 Instance with a recent Docker version installed.
+A Docker image is available in our [Docker Hub Repository](https://registry.hub.docker.com/u/amazon/amazon-ecs-agent/).
+
+*Note: The below command should work on most AMIs, but the cgroup and execdriver path may differ in some cases*
+
+```bash
+$ mkdir -p /var/log/ecs /etc/ecs /var/lib/ecs/data
+$ touch /etc/ecs/ecs.config
+$ docker run --name ecs-agent \
+    --restart on-failure:10 -d \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v /var/log/ecs:/log \
+    -v /var/lib/ecs/data:/data \
+    -v /var/lib/docker:/var/lib/docker \
+    -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+    -v /var/run/docker/execdriver/native:/var/lib/docker/execdriver/native:ro \
+    -p 127.0.0.1:51678:51678 \
+    --env-file /etc/ecs/ecs.config \
+    -e ECS_LOGFILE=/log/ecs-agent.log \
+    -e ECS_DATADIR=/data/ \
+    amazon/amazon-ecs-agent
+```
 
 See also the Advanced Usage section below.
 
@@ -94,6 +111,11 @@ configure them as something other than the defaults.
 | `ECS_DOCKER_GRAPHPATH`   | /var/lib/docker | Used to create the path to the state file of containers launched. The state file is used to read utilization metrics of containers. | /var/lib/docker |
 | `AWS_SESSION_TOKEN` |                         | The [Session Token](http://docs.aws.amazon.com/STS/latest/UsingSTS/Welcome.html) used for temporary credentials. | Taken from EC2 Instance Metadata |
 | `ECS_RESERVED_MEMORY` | 32 | Memory, in MB, to reserve for use by things other than containers managed by ECS. | 0 |
+| `ECS_AVAILABLE_LOGGING_DRIVERS` | `["json-file","syslog"]` | Which logging drivers are available on the Container Instance. | `["json-file"]` |
+| `ECS_DISABLE_PRIVILEGED` | `true` | Whether launching privileged containers is disabled on the Container Instance. | `false` |
+| `ECS_SELINUX_CAPABLE` | `true` | Whether SELinux is available on the Container Instance. | `false` |
+| `ECS_APPARMOR_CAPABLE` | `true` | Whether AppArmor is available on the Container Instance. | `false` |
+| `ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION` | 10m | Time to wait to delete containers for a stopped task. If set to less than 1 minute, the value will be ignored.  | 3h |
 
 ### Persistence
 

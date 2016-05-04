@@ -11,7 +11,7 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-FROM golang:1.4
+FROM amazon/amazon-ecs-agent-build:golang
 MAINTAINER Amazon Web Services, Inc.
 
 RUN mkdir /out
@@ -19,7 +19,6 @@ VOLUME ['/out']
 
 RUN mkdir -p /go/src/github.com/aws/
 
-COPY /scripts/build /scripts/build
 WORKDIR /go/src/github.com/aws/amazon-ecs-agent
 
-ENTRYPOINT /scripts/build
+CMD ["make", "static"]

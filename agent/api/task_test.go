@@ -14,11 +14,15 @@
 package api
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
+	"github.com/fsouza/go-dockerclient"
 )
+
+func strptr(s string) *string { return &s }
 
 func dockerMap(task *Task) map[string]*DockerContainer {
 	m := make(map[string]*DockerContainer)
@@ -194,6 +198,123 @@ func TestDockerHostConfigVolumesFrom(t *testing.T) {
 	}
 }
 
+func TestDockerHostConfigRawConfig(t *testing.T) {
+	rawHostConfigInput := docker.HostConfig{
+		Privileged:     true,
+		ReadonlyRootfs: true,
+		DNS:            []string{"dns1, dns2"},
+		DNSSearch:      []string{"dns.search"},
+		ExtraHosts:     []string{"extra:hosts"},
+		SecurityOpt:    []string{"foo", "bar"},
+		LogConfig: docker.LogConfig{
+			Type:   "foo",
+			Config: map[string]string{"foo": "bar"},
+		},
+		Ulimits: []docker.ULimit{docker.ULimit{Name: "ulimit name", Soft: 10, Hard: 100}},
+	}
+
+	rawHostConfig, err := json.Marshal(&rawHostConfigInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testTask := &Task{
+		Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		Family:  "myFamily",
+		Version: "1",
+		Containers: []*Container{
+			&Container{
+				Name: "c1",
+				DockerConfig: DockerConfig{
+					HostConfig: strptr(string(rawHostConfig)),
+				},
+			},
+		},
+	}
+
+	config, configErr := testTask.DockerHostConfig(testTask.Containers[0], dockerMap(testTask))
+	if configErr != nil {
+		t.Fatal(configErr)
+	}
+
+	expectedOutput := rawHostConfigInput
+
+	assertSetStructFieldsEqual(t, expectedOutput, *config)
+}
+
+func TestDockerHostConfigRawConfigMerging(t *testing.T) {
+	// Use a struct that will marshal to the actual message we expect; not
+	// docker.HostConfig which will include a lot of zero values.
+	rawHostConfigInput := struct {
+		Privileged  bool     `json:"Privileged,omitempty" yaml:"Privileged,omitempty"`
+		SecurityOpt []string `json:"SecurityOpt,omitempty" yaml:"SecurityOpt,omitempty"`
+	}{
+		Privileged:  true,
+		SecurityOpt: []string{"foo", "bar"},
+	}
+
+	rawHostConfig, err := json.Marshal(&rawHostConfigInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testTask := &Task{
+		Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		Family:  "myFamily",
+		Version: "1",
+		Containers: []*Container{
+			&Container{
+				Name:        "c1",
+				Image:       "image",
+				Cpu:         50,
+				Memory:      100,
+				VolumesFrom: []VolumeFrom{VolumeFrom{SourceContainer: "c2"}},
+				DockerConfig: DockerConfig{
+					HostConfig: strptr(string(rawHostConfig)),
+				},
+			},
+			&Container{
+				Name: "c2",
+			},
+		},
+	}
+
+	hostConfig, configErr := testTask.DockerHostConfig(testTask.Containers[0], dockerMap(testTask))
+	if configErr != nil {
+		t.Fatal(configErr)
+	}
+
+	expected := docker.HostConfig{
+		Privileged:  true,
+		SecurityOpt: []string{"foo", "bar"},
+		VolumesFrom: []string{"dockername-c2"},
+	}
+
+	assertSetStructFieldsEqual(t, expected, *hostConfig)
+}
+
+func TestBadDockerHostConfigRawConfig(t *testing.T) {
+	for _, badHostConfig := range []string{"malformed", `{"Privileged": "wrongType"}`} {
+		testTask := Task{
+			Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+			Family:  "myFamily",
+			Version: "1",
+			Containers: []*Container{
+				&Container{
+					Name: "c1",
+					DockerConfig: DockerConfig{
+						HostConfig: strptr(badHostConfig),
+					},
+				},
+			},
+		}
+		_, err := testTask.DockerHostConfig(testTask.Containers[0], dockerMap(&testTask))
+		if err == nil {
+			t.Fatal("Expected error, was none for: " + badHostConfig)
+		}
+	}
+}
+
 func TestDockerConfigLabels(t *testing.T) {
 	testTask := &Task{
 		Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
@@ -222,10 +343,173 @@ func TestDockerConfigLabels(t *testing.T) {
 	}
 }
 
-func TestTaskFromACS(t *testing.T) {
-	strptr := func(s string) *string {
-		return &s
+func TestDockerConfigMergesLabels(t *testing.T) {
+	testTask := &Task{
+		Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		Family:  "myFamily",
+		Version: "1",
+		Containers: []*Container{
+			&Container{
+				Name: "c1",
+				DockerConfig: DockerConfig{
+					Config: strptr(`{"Labels":{"key":"value"}}`),
+				},
+			},
+		},
 	}
+
+	config, err := testTask.DockerConfig(testTask.Containers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := map[string]string{
+		"com.amazonaws.ecs.task-arn":                "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		"com.amazonaws.ecs.container-name":          "c1",
+		"com.amazonaws.ecs.task-definition-family":  "myFamily",
+		"com.amazonaws.ecs.task-definition-version": "1",
+		"key": "value",
+	}
+	if !reflect.DeepEqual(config.Labels, expected) {
+		t.Fatal("Expected default ecs labels to be set, was: ", config.Labels)
+	}
+}
+
+func TestDockerConfigRawConfig(t *testing.T) {
+	rawConfigInput := docker.Config{
+		Hostname:        "hostname",
+		Domainname:      "domainname",
+		NetworkDisabled: true,
+		DNS:             []string{"dnsfoo", "dnsbar"},
+		WorkingDir:      "workdir",
+		User:            "user",
+	}
+
+	rawConfig, err := json.Marshal(&rawConfigInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testTask := &Task{
+		Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		Family:  "myFamily",
+		Version: "1",
+		Containers: []*Container{
+			&Container{
+				Name: "c1",
+				DockerConfig: DockerConfig{
+					Config: strptr(string(rawConfig)),
+				},
+			},
+		},
+	}
+
+	config, configErr := testTask.DockerConfig(testTask.Containers[0])
+	if configErr != nil {
+		t.Fatal(configErr)
+	}
+
+	expectedOutput := rawConfigInput
+	expectedOutput.CPUShares = 2
+
+	assertSetStructFieldsEqual(t, expectedOutput, *config)
+}
+
+func TestDockerConfigRawConfigNilLabel(t *testing.T) {
+	rawConfig, err := json.Marshal(&struct{ Labels map[string]string }{nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testTask := &Task{
+		Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		Family:  "myFamily",
+		Version: "1",
+		Containers: []*Container{
+			&Container{
+				Name: "c1",
+				DockerConfig: DockerConfig{
+					Config: strptr(string(rawConfig)),
+				},
+			},
+		},
+	}
+
+	_, configErr := testTask.DockerConfig(testTask.Containers[0])
+	if configErr != nil {
+		t.Fatal(configErr)
+	}
+}
+
+func TestDockerConfigRawConfigMerging(t *testing.T) {
+	// Use a struct that will marshal to the actual message we expect; not
+	// docker.Config which will include a lot of zero values.
+	rawConfigInput := struct {
+		User string `json:"User,omitempty" yaml:"User,omitempty"`
+	}{
+		User: "user",
+	}
+
+	rawConfig, err := json.Marshal(&rawConfigInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testTask := &Task{
+		Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		Family:  "myFamily",
+		Version: "1",
+		Containers: []*Container{
+			&Container{
+				Name:   "c1",
+				Image:  "image",
+				Cpu:    50,
+				Memory: 100,
+				DockerConfig: DockerConfig{
+					Config: strptr(string(rawConfig)),
+				},
+			},
+		},
+	}
+
+	config, configErr := testTask.DockerConfig(testTask.Containers[0])
+	if configErr != nil {
+		t.Fatal(configErr)
+	}
+
+	expected := docker.Config{
+		Memory:    100 * 1024 * 1024,
+		CPUShares: 50,
+		Image:     "image",
+		User:      "user",
+	}
+
+	assertSetStructFieldsEqual(t, expected, *config)
+}
+
+func TestBadDockerConfigRawConfig(t *testing.T) {
+	for _, badConfig := range []string{"malformed", `{"Labels": "wrongType"}`} {
+		testTask := Task{
+			Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+			Family:  "myFamily",
+			Version: "1",
+			Containers: []*Container{
+				&Container{
+					Name: "c1",
+					DockerConfig: DockerConfig{
+						Config: strptr(badConfig),
+					},
+				},
+			},
+		}
+		_, err := testTask.DockerConfig(testTask.Containers[0])
+		if err == nil {
+			t.Fatal("Expected error, was none for: " + badConfig)
+		}
+	}
+}
+
+func TestTaskFromACS(t *testing.T) {
 	intptr := func(i int64) *int64 {
 		return &i
 	}
@@ -270,6 +554,11 @@ func TestTaskFromACS(t *testing.T) {
 						ReadOnly:        boolptr(true),
 						SourceContainer: strptr("volumeLink"),
 					},
+				},
+				DockerConfig: &ecsacs.DockerConfig{
+					Config:     strptr("config json"),
+					HostConfig: strptr("hostconfig json"),
+					Version:    strptr("version string"),
 				},
 			},
 		},
@@ -321,6 +610,11 @@ func TestTaskFromACS(t *testing.T) {
 						SourceContainer: "volumeLink",
 					},
 				},
+				DockerConfig: DockerConfig{
+					Config:     strptr("config json"),
+					HostConfig: strptr("hostconfig json"),
+					Version:    strptr("version string"),
+				},
 			},
 		},
 		Volumes: []TaskVolume{
@@ -350,5 +644,20 @@ func TestTaskFromACS(t *testing.T) {
 	}
 	if !reflect.DeepEqual(task.StopSequenceNumber, expectedTask.StopSequenceNumber) {
 		t.Fatal("Should be equal")
+	}
+}
+
+func assertSetStructFieldsEqual(t *testing.T, expected, actual interface{}) {
+	for i := 0; i < reflect.TypeOf(expected).NumField(); i++ {
+		expectedValue := reflect.ValueOf(expected).Field(i)
+		// All the values we actaully expect to see are valid and non-nil
+		if !expectedValue.IsValid() || ((expectedValue.Kind() == reflect.Map || expectedValue.Kind() == reflect.Slice) && expectedValue.IsNil()) {
+			continue
+		}
+		expectedVal := expectedValue.Interface()
+		actualVal := reflect.ValueOf(actual).Field(i).Interface()
+		if !reflect.DeepEqual(expectedVal, actualVal) {
+			t.Fatalf("Field %v did not match: %v != %v", reflect.TypeOf(expected).Field(i).Name, expectedVal, actualVal)
+		}
 	}
 }
