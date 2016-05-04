@@ -327,7 +327,16 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
                 PortBindings: dockerPortMap,
                 VolumesFrom:  volumesFrom,
             }
+        
+            if container.DockerConfig.HostConfig != nil {
+                    err := json.Unmarshal([]byte(*container.DockerConfig.HostConfig), hostConfig)
+                    if err != nil {
+                            return nil, &HostConfigError{"Unable to decode given host config: " + err.Error()}
+                    }
+            }
+
             return hostConfig, nil
+    
         } else {
             fmt.Printf("Not attaching the GPU devices!\n")
             devices := make([]docker.Device, 0)
@@ -338,16 +347,17 @@ func (task *Task) dockerHostConfig(container *Container, dockerContainerMap map[
                 Devices:      devices,
 		PortBindings: dockerPortMap,
 		VolumesFrom:  volumesFrom,
-	}
+            }
 
-	if container.DockerConfig.HostConfig != nil {
-		err := json.Unmarshal([]byte(*container.DockerConfig.HostConfig), hostConfig)
-		if err != nil {
-			return nil, &HostConfigError{"Unable to decode given host config: " + err.Error()}
-		}
-	}
+            if container.DockerConfig.HostConfig != nil {
+                    err := json.Unmarshal([]byte(*container.DockerConfig.HostConfig), hostConfig)
+                    if err != nil {
+                            return nil, &HostConfigError{"Unable to decode given host config: " + err.Error()}
+                    }
+            }
 
-	return hostConfig, nil
+            return hostConfig, nil
+	}
 }
 
 func (task *Task) dockerLinks(container *Container, dockerContainerMap map[string]*DockerContainer) ([]string, error) {
