@@ -32,13 +32,29 @@ import (
 	"github.com/aws/amazon-ecs-agent/agent/ec2"
 	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	"github.com/aws/amazon-ecs-agent/agent/handlers"
+	"github.com/aws/amazon-ecs-agent/agent/utils"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/cloudwatch"
+	"github.com/aws/aws-sdk-go/service/iam"
 	docker "github.com/fsouza/go-dockerclient"
 )
 
 var ECS *ecs.ECS
 var Cluster string
+
+const (
+	defaultExecDriverPath = "/var/run/docker/execdriver"
+	logdir                = "/log"
+	datadir               = "/data"
+	ExecDriverDir         = "/var/lib/docker/execdriver"
+	defaultCgroupPath     = "/cgroup"
+	cacheDirectory        = "/var/cache/ecs"
+	configDirectory       = "/etc/ecs"
+	readOnly              = ":ro"
+	dockerEndpoint        = "/var/run/docker.sock"
+)
 
 func init() {
 	var ecsconfig aws.Config
@@ -76,11 +92,21 @@ func init() {
 // before a new one is registered and it is assumed that if it exists, the task
 // definition currently represented by the file was registered as such already.
 func GetTaskDefinition(name string) (string, error) {
+	return GetTaskDefinitionWithOverrides(name, make(map[string]string))
+}
+
+func GetTaskDefinitionWithOverrides(name string, overrides map[string]string) (string, error) {
 	_, filename, _, _ := runtime.Caller(0)
-	tdData, err := ioutil.ReadFile(filepath.Join(path.Dir(filename), "..", "testdata", "taskdefinitions", name, "task-definition.json"))
+	tdDataFromFile, err := ioutil.ReadFile(filepath.Join(path.Dir(filename), "..", "testdata", "taskdefinitions", name, "task-definition.json"))
 	if err != nil {
 		return "", err
 	}
+
+	tdStr := string(tdDataFromFile)
+	for key, value := range overrides {
+		tdStr = strings.Replace(tdStr, key, value, -1)
+	}
+	tdData := []byte(tdStr)
 
 	registerRequest := &ecs.RegisterTaskDefinitionInput{}
 	err = json.Unmarshal(tdData, registerRequest)
@@ -125,6 +151,7 @@ type TestAgent struct {
 type AgentOptions struct {
 	ExtraEnvironment map[string]string
 	ContainerLinks   []string
+	PortBindings     map[docker.Port]map[string]string
 }
 
 // RunAgent launches the agent and returns an object which may be used to reference it.
@@ -161,7 +188,7 @@ func RunAgent(t *testing.T, options *AgentOptions) *TestAgent {
 	if err != nil {
 		t.Fatal("Could not create temp dir for test")
 	}
-	logdir := filepath.Join(agentTempdir, "logs")
+	logdir := filepath.Join(agentTempdir, "log")
 	datadir := filepath.Join(agentTempdir, "data")
 	os.Mkdir(logdir, 0755)
 	os.Mkdir(datadir, 0755)
@@ -171,6 +198,7 @@ func RunAgent(t *testing.T, options *AgentOptions) *TestAgent {
 		agent.Options = &AgentOptions{}
 	}
 	t.Logf("Created directory %s to store test data in", agentTempdir)
+
 	err = agent.StartAgent()
 	if err != nil {
 		t.Fatal(err)
@@ -184,10 +212,6 @@ func (agent *TestAgent) StopAgent() error {
 
 func (agent *TestAgent) StartAgent() error {
 	agent.t.Logf("Launching agent with image: %s\n", agent.Image)
-	logdir := filepath.Join(agent.TestDir, "logs")
-	datadir := filepath.Join(agent.TestDir, "data")
-	agent.Logdir = logdir
-
 	dockerConfig := &docker.Config{
 		Image: agent.Image,
 		ExposedPorts: map[docker.Port]struct{}{
@@ -197,7 +221,7 @@ func (agent *TestAgent) StartAgent() error {
 			"ECS_CLUSTER=" + Cluster,
 			"ECS_DATADIR=/data",
 			"ECS_LOGLEVEL=debug",
-			"ECS_LOGFILE=/logs/integ_agent.log",
+			"ECS_LOGFILE=/log/integ_agent.log",
 			"ECS_BACKEND_HOST=" + os.Getenv("ECS_BACKEND_HOST"),
 			"AWS_ACCESS_KEY_ID=" + os.Getenv("AWS_ACCESS_KEY_ID"),
 			"AWS_DEFAULT_REGION=" + *ECS.Config.Region,
@@ -207,12 +231,10 @@ func (agent *TestAgent) StartAgent() error {
 		Cmd: strings.Split(os.Getenv("ECS_FTEST_AGENT_ARGS"), " "),
 	}
 
+	binds := agent.getBindMounts()
+
 	hostConfig := &docker.HostConfig{
-		Binds: []string{
-			"/var/run/docker.sock:/var/run/docker.sock",
-			logdir + ":/logs",
-			datadir + ":/data",
-		},
+		Binds: binds,
 		PortBindings: map[docker.Port][]docker.PortBinding{
 			"51678/tcp": []docker.PortBinding{docker.PortBinding{HostIP: "0.0.0.0"}},
 		},
@@ -220,8 +242,24 @@ func (agent *TestAgent) StartAgent() error {
 	}
 
 	if agent.Options != nil {
+		// Override the default docker envrionment variable
 		for key, value := range agent.Options.ExtraEnvironment {
-			dockerConfig.Env = append(dockerConfig.Env, key+"="+value)
+			envVarExists := false
+			for i, str := range dockerConfig.Env {
+				if strings.HasPrefix(str, key+"=") {
+					dockerConfig.Env[i] = key + "=" + value
+					envVarExists = true
+					break
+				}
+			}
+			if !envVarExists {
+				dockerConfig.Env = append(dockerConfig.Env, key+"="+value)
+			}
+		}
+
+		for key, value := range agent.Options.PortBindings {
+			hostConfig.PortBindings[key] = []docker.PortBinding{docker.PortBinding{HostIP: value["HostIP"], HostPort: value["HostPort"]}}
+			dockerConfig.ExposedPorts[key] = struct{}{}
 		}
 	}
 
@@ -287,6 +325,35 @@ func (agent *TestAgent) StartAgent() error {
 	return nil
 }
 
+// getBindMounts actually constructs volume binds for container's host config
+// It also additionally checks for envrionment variables:
+// * CGROUP_PATH: the cgroup path
+// * EXECDRIVER_PATH: the path of metrics
+func (agent *TestAgent) getBindMounts() []string {
+	var binds []string
+	cgroupPath := utils.DefaultIfBlank(os.Getenv("CGROUP_PATH"), defaultCgroupPath)
+	cgroupBind := cgroupPath + ":" + cgroupPath + readOnly
+	binds = append(binds, cgroupBind)
+
+	execdriverPath := utils.DefaultIfBlank(os.Getenv("EXECDRIVER_PATH"), defaultExecDriverPath)
+	execdriverBind := execdriverPath + ":" + ExecDriverDir + readOnly
+	binds = append(binds, execdriverBind)
+
+	hostLogDir := filepath.Join(agent.TestDir, "log")
+	hostDataDir := filepath.Join(agent.TestDir, "data")
+	hostConfigDir := filepath.Join(agent.TestDir, "config")
+	hostCacheDir := filepath.Join(agent.TestDir, "cache")
+	agent.Logdir = hostLogDir
+
+	binds = append(binds, hostLogDir+":"+logdir)
+	binds = append(binds, hostDataDir+":"+datadir)
+	binds = append(binds, dockerEndpoint+":"+dockerEndpoint)
+	binds = append(binds, hostConfigDir+":"+configDirectory)
+	binds = append(binds, hostCacheDir+":"+cacheDirectory)
+
+	return binds
+}
+
 func (agent *TestAgent) Cleanup() {
 	agent.StopAgent()
 	if agent.t.Failed() {
@@ -302,13 +369,8 @@ func (agent *TestAgent) Cleanup() {
 	})
 }
 
-func (agent *TestAgent) StartMultipleTasks(t *testing.T, task string, num int) ([]*TestTask, error) {
-	td, err := GetTaskDefinition(task)
-	if err != nil {
-		return nil, err
-	}
-	t.Logf("Task definition: %s", td)
-
+func (agent *TestAgent) StartMultipleTasks(t *testing.T, taskDefinition string, num int) ([]*TestTask, error) {
+	t.Logf("Task definition: %s", taskDefinition)
 	cis := make([]*string, num)
 	for i := 0; i < num; i++ {
 		cis[i] = &agent.ContainerInstanceArn
@@ -317,7 +379,7 @@ func (agent *TestAgent) StartMultipleTasks(t *testing.T, task string, num int) (
 	resp, err := ECS.StartTask(&ecs.StartTaskInput{
 		Cluster:            &agent.Cluster,
 		ContainerInstances: cis,
-		TaskDefinition:     &td,
+		TaskDefinition:     &taskDefinition,
 	})
 	if err != nil {
 		return nil, err
@@ -335,10 +397,29 @@ func (agent *TestAgent) StartMultipleTasks(t *testing.T, task string, num int) (
 }
 
 func (agent *TestAgent) StartTask(t *testing.T, task string) (*TestTask, error) {
-	tasks, err := agent.StartMultipleTasks(t, task, 1)
+	td, err := GetTaskDefinition(task)
 	if err != nil {
 		return nil, err
 	}
+
+	tasks, err := agent.StartMultipleTasks(t, td, 1)
+	if err != nil {
+		return nil, err
+	}
+	return tasks[0], nil
+}
+
+func (agent *TestAgent) StartTaskWithTaskDefinitionOverrides(t *testing.T, task string, overrides map[string]string) (*TestTask, error) {
+	td, err := GetTaskDefinitionWithOverrides(task, overrides)
+	if err != nil {
+		return nil, err
+	}
+
+	tasks, err := agent.StartMultipleTasks(t, td, 1)
+	if err != nil {
+		return nil, err
+	}
+
 	return tasks[0], nil
 }
 
@@ -366,6 +447,58 @@ func (agent *TestAgent) StartTaskWithOverrides(t *testing.T, task string, overri
 
 	agent.t.Logf("Started task: %s\n", *resp.Tasks[0].TaskArn)
 	return &TestTask{resp.Tasks[0]}, nil
+}
+
+// RoundTimeUp rounds the time to the next second/minute/hours depending on the duration
+func RoundTimeUp(realTime time.Time, duration time.Duration) time.Time {
+	tmpTime := realTime.Round(duration)
+	if tmpTime.Before(realTime) {
+		return tmpTime.Add(duration)
+	}
+	return tmpTime
+}
+
+func DeleteCluster(t *testing.T, clusterName string) {
+	_, err := ECS.DeleteCluster(&ecs.DeleteClusterInput{
+		Cluster: aws.String(clusterName),
+	})
+	if err != nil {
+		t.Fatalf("Failed to delete the cluster: %s: %v", clusterName, err)
+	}
+}
+
+// VerifyMetrics whether the response is as expected
+// the expected value can be 0 or positive
+func VerifyMetrics(cwclient *cloudwatch.CloudWatch, params *cloudwatch.GetMetricStatisticsInput, idleCluster bool) error {
+	resp, err := cwclient.GetMetricStatistics(params)
+	if err != nil {
+		return fmt.Errorf("Error getting metrics of cluster: %v", err)
+	}
+
+	if resp == nil || resp.Datapoints == nil {
+		return fmt.Errorf("Cloudwatch get metrics failed, returned null")
+	}
+	metricsCount := len(resp.Datapoints)
+	if metricsCount == 0 {
+		return fmt.Errorf("No datapoints returned")
+	}
+
+	datapoint := resp.Datapoints[metricsCount-1]
+	// Samplecount is always expected to be "1" for cluster metrics
+	if *datapoint.SampleCount != 1.0 {
+		return fmt.Errorf("Incorrect SampleCount %f, expected 1", *datapoint.SampleCount)
+	}
+
+	if idleCluster {
+		if *datapoint.Average != 0.0 {
+			return fmt.Errorf("non-zero utilization for idle cluster")
+		}
+	} else {
+		if *datapoint.Average == 0.0 {
+			return fmt.Errorf("utilization is zero for non-idle cluster")
+		}
+	}
+	return nil
 }
 
 // ResolveTaskDockerID determines the Docker ID for a container within a given
@@ -612,4 +745,82 @@ func RequireDockerVersion(t *testing.T, selector string) {
 	if !match {
 		t.Skipf("Skipping test; requires %v, but version is %v", selector, version)
 	}
+}
+
+// GetInstanceProfileName gets the instance profile name
+func GetInstanceMetadata(path string) (string, error) {
+	ec2MetadataClient := ec2metadata.New(session.New())
+	return ec2MetadataClient.GetMetadata(path)
+}
+
+// GetInstanceIAMRole gets the iam roles attached to the instance profile
+func GetInstanceIAMRole() (*iam.Role, error) {
+	// This returns the name of the role
+	instanceRoleName, err := GetInstanceMetadata("iam/security-credentials")
+	if err != nil {
+		return nil, fmt.Errorf("Error getting instance role name, err: %v", err)
+	}
+	if utils.ZeroOrNil(instanceRoleName) {
+		return nil, fmt.Errorf("Instance Role name nil")
+	}
+
+	iamClient := iam.New(session.New())
+	instanceRole, err := iamClient.GetRole(&iam.GetRoleInput{
+		RoleName: aws.String(instanceRoleName),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return instanceRole.Role, nil
+}
+
+// SearchStrInDir searches the files in direcotry for specific content
+func SearchStrInDir(dir, filePrefix, content string) error {
+	logfiles, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("Error reading the directory, err %v", err)
+	}
+
+	var desiredFile string
+	for _, file := range logfiles {
+		if strings.HasPrefix(file.Name(), filePrefix) {
+			desiredFile = file.Name()
+			break
+		}
+	}
+
+	if utils.ZeroOrNil(desiredFile) {
+		return fmt.Errorf("File with prefix: %v does not exist", filePrefix)
+	}
+
+	data, err := ioutil.ReadFile(filepath.Join(dir, desiredFile))
+	if err != nil {
+		return fmt.Errorf("Failed to read file, err: %v", err)
+	}
+
+	if !strings.Contains(string(data), content) {
+		return fmt.Errorf("Could not find the content: %v in the file: %v", content, desiredFile)
+	}
+
+	return nil
+}
+
+// GetContainerNetworkMode gets the container network mode, given container id
+func (agent *TestAgent) GetContainerNetworkMode(containerId string) ([]string, error) {
+	containerMetaData, err := agent.DockerClient.InspectContainer(containerId)
+	if err != nil {
+		return nil, fmt.Errorf("Could not inspect container for task: %v", err)
+	}
+
+	if containerMetaData.NetworkSettings == nil {
+		return nil, fmt.Errorf("Couldn't find the container network setting info")
+	}
+
+	var networks []string
+	for key := range containerMetaData.NetworkSettings.Networks {
+		networks = append(networks, key)
+	}
+
+	return networks, nil
 }

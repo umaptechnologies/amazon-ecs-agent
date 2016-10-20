@@ -1,4 +1,4 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -23,12 +23,14 @@ import (
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/api/mocks"
+	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/tcs/client"
 	"github.com/aws/amazon-ecs-agent/agent/tcs/model/ecstcs"
 	"github.com/aws/amazon-ecs-agent/agent/wsclient"
 	"github.com/aws/amazon-ecs-agent/agent/wsclient/mock/utils"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/golang/mock/gomock"
+	"golang.org/x/net/context"
 )
 
 const (
@@ -84,8 +86,9 @@ func TestStartSession(t *testing.T) {
 		close(serverChan)
 	}()
 
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", context.Background())
 	// Start a session with the test server.
-	go startSession(server.URL, "us-east-1", credentials.AnonymousCredentials, true, &mockStatsEngine{}, testPublishMetricsInterval)
+	go startSession(server.URL, "us-east-1", credentials.AnonymousCredentials, true, &mockStatsEngine{}, testPublishMetricsInterval, deregisterInstanceEventStream)
 
 	// startSession internally starts publishing metrics from the mockStatsEngine object.
 	time.Sleep(testPublishMetricsInterval)
@@ -118,7 +121,10 @@ func TestSessionConenctionClosedByRemote(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() {
-		t.Error(<-serverErr)
+		serr := <-serverErr
+		if serr != io.EOF {
+			t.Error(serr)
+		}
 	}()
 	sleepBeforeClose := 10 * time.Millisecond
 	go func() {
@@ -127,8 +133,13 @@ func TestSessionConenctionClosedByRemote(t *testing.T) {
 		close(serverChan)
 	}()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	deregisterInstanceEventStream := eventstream.NewEventStream("Deregister_Instance", ctx)
+	deregisterInstanceEventStream.StartListening()
+	defer cancel()
+
 	// Start a session with the test server.
-	err = startSession(server.URL, "us-east-1", credentials.AnonymousCredentials, true, &mockStatsEngine{}, testPublishMetricsInterval)
+	err = startSession(server.URL, "us-east-1", credentials.AnonymousCredentials, true, &mockStatsEngine{}, testPublishMetricsInterval, deregisterInstanceEventStream)
 
 	if err == nil {
 		t.Error("Expected io.EOF on closed connection")

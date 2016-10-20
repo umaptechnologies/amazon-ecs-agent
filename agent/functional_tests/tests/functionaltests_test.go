@@ -22,13 +22,26 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/ecs_client/model/ecs"
 	. "github.com/aws/amazon-ecs-agent/agent/functional_tests/util"
+	"github.com/aws/amazon-ecs-agent/agent/utils"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/cloudwatch"
+	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	docker "github.com/fsouza/go-dockerclient"
+	"github.com/pborman/uuid"
+)
+
+const (
+	waitTaskStateChangeDuration     = 2 * time.Minute
+	waitMetricsInCloudwatchDuration = 4 * time.Minute
+	awslogsLogGroupName             = "ecs-functional-tests"
 )
 
 // TestRunManyTasks runs several tasks in short succession and expects them to
@@ -40,12 +53,18 @@ func TestRunManyTasks(t *testing.T) {
 	numToRun := 15
 	tasks := []*TestTask{}
 	attemptsTaken := 0
+
+	td, err := GetTaskDefinition("simple-exit")
+	if err != nil {
+		t.Fatalf("Get task definition error: %v", err)
+	}
 	for numRun := 0; len(tasks) < numToRun; attemptsTaken++ {
 		startNum := 10
 		if numToRun-len(tasks) < 10 {
 			startNum = numToRun - len(tasks)
 		}
-		startedTasks, err := agent.StartMultipleTasks(t, "simple-exit", startNum)
+
+		startedTasks, err := agent.StartMultipleTasks(t, td, startNum)
 		if err != nil {
 			continue
 		}
@@ -142,7 +161,7 @@ func TestTaskCleanupDoesNotDeadlock(t *testing.T) {
 		}
 
 		// Wait for the tasks to be cleaned up
-		time.Sleep(75 * time.Second)
+		time.Sleep(90 * time.Second)
 
 		// Ensure that tasks are cleaned up. WWe should not be able to describe the
 		// container now since it has been cleaned up.
@@ -367,7 +386,7 @@ func TestDockerAuth(t *testing.T) {
 
 func TestSquidProxy(t *testing.T) {
 	// Run a squid proxy manually, verify that the agent can connect through it
-	client, err := docker.NewClientFromEnv()
+	client, err := docker.NewVersionedClientFromEnv("1.17")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,6 +508,80 @@ func TestSquidProxy(t *testing.T) {
 	}
 }
 
+// TestAwslogsDriver verifies that container logs are sent to Amazon CloudWatch Logs with awslogs as the log driver
+func TestAwslogsDriver(t *testing.T) {
+	RequireDockerVersion(t, ">=1.9.0") // awslogs drivers available from docker 1.9.0
+	cwlClient := cloudwatchlogs.New(session.New(), aws.NewConfig().WithRegion(*ECS.Config.Region))
+	// Test whether the log group existed or not
+	respDescribeLogGroups, err := cwlClient.DescribeLogGroups(&cloudwatchlogs.DescribeLogGroupsInput{
+		LogGroupNamePrefix: aws.String(awslogsLogGroupName),
+	})
+	if err != nil {
+		t.Fatalf("CloudWatchLogs describe log groups error: %v", err)
+	}
+	logGroupExists := false
+	for i := 0; i < len(respDescribeLogGroups.LogGroups); i++ {
+		if *respDescribeLogGroups.LogGroups[i].LogGroupName == awslogsLogGroupName {
+			logGroupExists = true
+			break
+		}
+	}
+
+	if !logGroupExists {
+		_, err := cwlClient.CreateLogGroup(&cloudwatchlogs.CreateLogGroupInput{
+			LogGroupName: aws.String(awslogsLogGroupName),
+		})
+		if err != nil {
+			t.Fatalf("Failed to create log group %s : %v", awslogsLogGroupName, err)
+		}
+	}
+
+	agentOptions := AgentOptions{
+		ExtraEnvironment: map[string]string{
+			"ECS_AVAILABLE_LOGGING_DRIVERS": `["awslogs"]`,
+		},
+	}
+	agent := RunAgent(t, &agentOptions)
+	defer agent.Cleanup()
+	agent.RequireVersion(">=1.9.0") //Required for awslogs driver
+
+	tdOverrides := make(map[string]string)
+	tdOverrides["$$$TEST_REGION$$$"] = *ECS.Config.Region
+
+	testTask, err := agent.StartTaskWithTaskDefinitionOverrides(t, "awslogs", tdOverrides)
+	if err != nil {
+		t.Fatalf("Expected to start task using awslogs driver failed: %v", err)
+	}
+
+	// Wait for the container to start
+	testTask.WaitRunning(waitTaskStateChangeDuration)
+	strs := strings.Split(*testTask.TaskArn, "/")
+	taskId := strs[len(strs)-1]
+
+	// Delete the log stream after the test
+	defer func() {
+		cwlClient.DeleteLogStream(&cloudwatchlogs.DeleteLogStreamInput{
+			LogGroupName:  aws.String(awslogsLogGroupName),
+			LogStreamName: aws.String(fmt.Sprintf("ecs-functional-tests/awslogs/%s", taskId)),
+		})
+	}()
+
+	params := &cloudwatchlogs.GetLogEventsInput{
+		LogGroupName:  aws.String(awslogsLogGroupName),
+		LogStreamName: aws.String(fmt.Sprintf("ecs-functional-tests/awslogs/%s", taskId)),
+	}
+	resp, err := cwlClient.GetLogEvents(params)
+	if err != nil {
+		t.Fatalf("CloudWatchLogs get log failed: %v", err)
+	}
+
+	if len(resp.Events) != 1 {
+		t.Errorf("Get unexpected number of log events: %d", len(resp.Events))
+	} else if *resp.Events[0].Message != "hello world" {
+		t.Errorf("Got log events message unexpected: %s", *resp.Events[0].Message)
+	}
+}
+
 func TestTaskCleanup(t *testing.T) {
 	// Set the task cleanup time to just over a minute.
 	os.Setenv("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION", "70s")
@@ -538,4 +631,323 @@ func TestTaskCleanup(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Expected error inspecting container in task")
 	}
+}
+
+// TestTelemetry tests whether agent can send metrics to TACS
+func TestTelemetry(t *testing.T) {
+	// Try to use a new cluster for this test, ensure no other task metrics for this cluster
+	newClusterName := "ecstest-telemetry-" + uuid.New()
+	_, err := ECS.CreateCluster(&ecs.CreateClusterInput{
+		ClusterName: aws.String(newClusterName),
+	})
+	if err != nil {
+		t.Fatalf("Failed to create cluster %s : %v", newClusterName, err)
+	}
+	defer DeleteCluster(t, newClusterName)
+
+	agentOptions := AgentOptions{
+		ExtraEnvironment: map[string]string{
+			"ECS_CLUSTER": newClusterName,
+		},
+	}
+	agent := RunAgent(t, &agentOptions)
+	defer agent.Cleanup()
+
+	params := &cloudwatch.GetMetricStatisticsInput{
+		MetricName: aws.String("CPUUtilization"),
+		Namespace:  aws.String("AWS/ECS"),
+		Period:     aws.Int64(60),
+		Statistics: []*string{
+			aws.String("Average"),
+			aws.String("SampleCount"),
+		},
+		Dimensions: []*cloudwatch.Dimension{
+			{
+				Name:  aws.String("ClusterName"),
+				Value: aws.String(newClusterName),
+			},
+		},
+	}
+	params.StartTime = aws.Time(RoundTimeUp(time.Now(), time.Minute).UTC())
+	params.EndTime = aws.Time((*params.StartTime).Add(waitMetricsInCloudwatchDuration).UTC())
+	// wait for the agent start and ensure no task is running
+	time.Sleep(waitMetricsInCloudwatchDuration)
+
+	cwclient := cloudwatch.New(session.New(), aws.NewConfig().WithRegion(*ECS.Config.Region))
+	if err = VerifyMetrics(cwclient, params, true); err != nil {
+		t.Errorf("Before task running, verify metrics for CPU utilization failed: %v", err)
+	}
+
+	params.MetricName = aws.String("MemoryUtilization")
+	if err = VerifyMetrics(cwclient, params, true); err != nil {
+		t.Errorf("Before task running, verify metrics for memory utilization failed: %v", err)
+	}
+
+	testTask, err := agent.StartTask(t, "telemetry")
+	if err != nil {
+		t.Fatalf("Expected to start telemetry task: %v", err)
+	}
+	// Wait for the task to run and the agent to send back metrics
+	err = testTask.WaitRunning(waitTaskStateChangeDuration)
+	if err != nil {
+		t.Fatalf("Error start telemetry task: %v", err)
+	}
+
+	time.Sleep(waitMetricsInCloudwatchDuration)
+	params.EndTime = aws.Time(RoundTimeUp(time.Now(), time.Minute).UTC())
+	params.StartTime = aws.Time((*params.EndTime).Add(-waitMetricsInCloudwatchDuration).UTC())
+	params.MetricName = aws.String("CPUUtilization")
+	if err = VerifyMetrics(cwclient, params, false); err != nil {
+		t.Errorf("Task is running, verify metrics for CPU utilization failed: %v", err)
+	}
+
+	params.MetricName = aws.String("MemoryUtilization")
+	if err = VerifyMetrics(cwclient, params, false); err != nil {
+		t.Errorf("Task is running, verify metrics for memory utilization failed: %v", err)
+	}
+
+	err = testTask.Stop()
+	if err != nil {
+		t.Fatalf("Failed to stop the telemetry task: %v", err)
+	}
+
+	err = testTask.WaitStopped(waitTaskStateChangeDuration)
+	if err != nil {
+		t.Fatalf("Waiting for task stop error: %v", err)
+	}
+
+	time.Sleep(waitMetricsInCloudwatchDuration)
+	params.EndTime = aws.Time(RoundTimeUp(time.Now(), time.Minute).UTC())
+	params.StartTime = aws.Time((*params.EndTime).Add(-waitMetricsInCloudwatchDuration).UTC())
+	params.MetricName = aws.String("CPUUtilization")
+	if err = VerifyMetrics(cwclient, params, true); err != nil {
+		t.Errorf("Task stopped: verify metrics for CPU utilization failed:  %v", err)
+	}
+
+	params.MetricName = aws.String("MemoryUtilization")
+	if err = VerifyMetrics(cwclient, params, true); err != nil {
+		t.Errorf("Task stopped, verify metrics for memory utilization failed: %v", err)
+	}
+}
+
+func TestTaskIamRolesNetHostMode(t *testing.T) {
+	// The test runs only when the environment TEST_IAM_ROLE was set
+	if os.Getenv("TEST_TASK_IAM_ROLE_NET_HOST") != "true" {
+		t.Skip("Skipping test TaskIamRole in host network mode, as TEST_TASK_IAM_ROLE_NET_HOST isn't set true")
+	}
+	agentOptions := &AgentOptions{
+		ExtraEnvironment: map[string]string{
+			"ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST": "true",
+			"ECS_ENABLE_TASK_IAM_ROLE":              "true",
+		},
+		PortBindings: map[docker.Port]map[string]string{
+			"51679/tcp": map[string]string{
+				"HostIP":   "0.0.0.0",
+				"HostPort": "51679",
+			},
+		},
+	}
+	agent := RunAgent(t, agentOptions)
+	defer agent.Cleanup()
+
+	taskIamRolesTest("host", agent, t)
+}
+
+func TestTaskIamRolesDefaultNetworkMode(t *testing.T) {
+	// The test runs only when the environment TEST_IAM_ROLE was set
+	if os.Getenv("TEST_TASK_IAM_ROLE") != "true" {
+		t.Skip("Skipping test TaskIamRole in default network mode, as TEST_TASK_IAM_ROLE isn't set true")
+	}
+
+	agentOptions := &AgentOptions{
+		ExtraEnvironment: map[string]string{
+			"ECS_ENABLE_TASK_IAM_ROLE": "true",
+		},
+		PortBindings: map[docker.Port]map[string]string{
+			"51679/tcp": map[string]string{
+				"HostIP":   "0.0.0.0",
+				"HostPort": "51679",
+			},
+		},
+	}
+	agent := RunAgent(t, agentOptions)
+	defer agent.Cleanup()
+
+	taskIamRolesTest("bridge", agent, t)
+}
+
+func taskIamRolesTest(networkMode string, agent *TestAgent, t *testing.T) {
+	RequireDockerVersion(t, ">=1.11.0") // TaskIamRole is available from agent 1.11.0
+	roleArn := os.Getenv("TASK_IAM_ROLE_ARN")
+	if utils.ZeroOrNil(roleArn) {
+		t.Logf("TASK_IAM_ROLE_ARN not set, will try to use the role attached to instance profile")
+		role, err := GetInstanceIAMRole()
+		if err != nil {
+			t.Fatalf("Error getting IAM Roles from instance profile, err: %v", err)
+		}
+		roleArn = *role.Arn
+	}
+
+	tdOverride := make(map[string]string)
+	tdOverride["$$$TASK_ROLE$$$"] = roleArn
+	tdOverride["$$$TEST_REGION$$$"] = *ECS.Config.Region
+	tdOverride["$$$NETWORK_MODE$$$"] = networkMode
+
+	task, err := agent.StartTaskWithTaskDefinitionOverrides(t, "iam-roles", tdOverride)
+	if err != nil {
+		t.Fatalf("Error start iam-roles task: %v", err)
+	}
+	err = task.WaitRunning(waitTaskStateChangeDuration)
+	if err != nil {
+		t.Fatalf("Error waiting for task to run: %v", err)
+	}
+	containerId, err := agent.ResolveTaskDockerID(task, "container-with-iamrole")
+	if err != nil {
+		t.Fatalf("Error resolving docker id for container in task: %v", err)
+	}
+
+	// TaskIAMRoles enabled contaienr should have the ExtraEnvironment variable AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+	containerMetaData, err := agent.DockerClient.InspectContainer(containerId)
+	if err != nil {
+		t.Fatalf("Could not inspect container for task: %v", err)
+	}
+	iamRoleEnabled := false
+	if containerMetaData.Config != nil {
+		for _, env := range containerMetaData.Config.Env {
+			if strings.HasPrefix(env, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=") {
+				iamRoleEnabled = true
+				break
+			}
+		}
+	}
+	if !iamRoleEnabled {
+		task.Stop()
+		t.Fatalf("Could not found AWS_CONTAINER_CREDENTIALS_RELATIVE_URI in the container envrionment variable")
+	}
+
+	// Task will only run one command "aws ec2 describe-regions"
+	err = task.WaitStopped(30 * time.Second)
+	if err != nil {
+		t.Fatalf("Waiting task to stop error : %v", err)
+	}
+
+	containerMetaData, err = agent.DockerClient.InspectContainer(containerId)
+	if err != nil {
+		t.Fatalf("Could not inspect container for task: %v", err)
+	}
+
+	if containerMetaData.State.ExitCode != 0 {
+		t.Fatalf("Container exit code non-zero: %v", containerMetaData.State.ExitCode)
+	}
+
+	// Search the audit log to verify the credential request
+	err = SearchStrInDir(filepath.Join(agent.TestDir, "log"), "audit.log.", *task.TaskArn)
+	if err != nil {
+		t.Fatalf("Verify credential request failed, err: %v", err)
+	}
+}
+
+// TestMemoryOvercommit tests the MemoryReservation of container can be configured in task definition
+func TestMemoryOvercommit(t *testing.T) {
+	agent := RunAgent(t, nil)
+	defer agent.Cleanup()
+
+	memoryReservation := int64(50)
+	tdOverride := make(map[string]string)
+
+	tdOverride["$$$$MEMORY_RESERVATION$$$$"] = strconv.FormatInt(memoryReservation, 10)
+	task, err := agent.StartTaskWithTaskDefinitionOverrides(t, "memory-overcommit", tdOverride)
+	if err != nil {
+		t.Fatalf("Error starting task: %v", err)
+	}
+	defer task.Stop()
+
+	err = task.WaitRunning(waitTaskStateChangeDuration)
+	if err != nil {
+		t.Fatalf("Error waiting for running task: %v", err)
+	}
+
+	containerId, err := agent.ResolveTaskDockerID(task, "memory-overcommit")
+	if err != nil {
+		t.Fatalf("Error resolving docker id for container in task: %v", err)
+	}
+
+	containerMetaData, err := agent.DockerClient.InspectContainer(containerId)
+	if err != nil {
+		t.Fatalf("Could not inspect container for task: %v", err)
+	}
+
+	if containerMetaData.HostConfig.MemoryReservation != memoryReservation*1024*1024 {
+		t.Fatalf("MemoryReservation in container metadata is not as expected: %v, expected: %v", containerMetaData.HostConfig.MemoryReservation, memoryReservation*1024*1024)
+	}
+}
+
+// TestNetworkModeBridge tests the container network can be configured
+// as host mode in task definition
+func TestNetworkModeHost(t *testing.T) {
+	agent := RunAgent(t, nil)
+	defer agent.Cleanup()
+
+	err := networkModeTest(t, agent, "host")
+	if err != nil {
+		t.Fatalf("Networking mode host testing failed, err: %v", err)
+	}
+}
+
+// TestNetworkModeBridge tests the container network can be configured
+// as none mode in task definition
+func TestNetworkModeNone(t *testing.T) {
+	agent := RunAgent(t, nil)
+	defer agent.Cleanup()
+
+	err := networkModeTest(t, agent, "none")
+	if err != nil {
+		t.Fatalf("Networking mode none testing failed, err: %v", err)
+	}
+}
+
+// TestNetworkModeBridge tests the container network can be configured
+// as bridge mode in task definition
+func TestNetworkModeBridge(t *testing.T) {
+	agent := RunAgent(t, nil)
+	defer agent.Cleanup()
+
+	err := networkModeTest(t, agent, "bridge")
+	if err != nil {
+		t.Fatalf("Networking mode bridge testing failed, err: %v", err)
+	}
+}
+
+// TestNetworkMode tests the contaienr network mode is configured in task definition correctly
+func networkModeTest(t *testing.T, agent *TestAgent, mode string) error {
+	tdOverride := make(map[string]string)
+
+	// Test the host network mode
+	tdOverride["$$$$NETWORK_MODE$$$$"] = mode
+	task, err := agent.StartTaskWithTaskDefinitionOverrides(t, "network-mode", tdOverride)
+	if err != nil {
+		return fmt.Errorf("error starting task with network %v, err: %v", mode, err)
+	}
+	defer task.Stop()
+
+	err = task.WaitRunning(waitTaskStateChangeDuration)
+	if err != nil {
+		return fmt.Errorf("error waiting for task running, err: %v", err)
+	}
+	containerId, err := agent.ResolveTaskDockerID(task, "network-"+mode)
+	if err != nil {
+		return fmt.Errorf("error resolving docker id for container \"network-none\": %v", err)
+	}
+
+	networks, err := agent.GetContainerNetworkMode(containerId)
+	if err != nil {
+		return err
+	}
+	if len(networks) != 1 {
+		return fmt.Errorf("found multiple networks in container config")
+	}
+	if networks[0] != mode {
+		return fmt.Errorf("did not found the expected network mode")
+	}
+	return nil
 }

@@ -1,4 +1,4 @@
-// Copyright 2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2015-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -68,6 +68,20 @@ func (_m *MockClientServer) Connect() error {
 
 func (_mr *_MockClientServerRecorder) Connect() *gomock.Call {
 	return _mr.mock.ctrl.RecordCall(_mr.mock, "Connect")
+}
+
+func (_m *MockClientServer) Disconnect(_param0 ...interface{}) error {
+	_s := []interface{}{}
+	for _, _x := range _param0 {
+		_s = append(_s, _x)
+	}
+	ret := _m.ctrl.Call(_m, "Disconnect", _s...)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+func (_mr *_MockClientServerRecorder) Disconnect(arg0 ...interface{}) *gomock.Call {
+	return _mr.mock.ctrl.RecordCall(_mr.mock, "Disconnect", arg0...)
 }
 
 func (_m *MockClientServer) MakeRequest(_param0 interface{}) error {

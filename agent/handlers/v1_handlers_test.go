@@ -1,4 +1,4 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -38,7 +38,7 @@ func TestMetadataHandler(t *testing.T) {
 	metadataHandler := metadataV1RequestHandlerMaker(utils.Strptr(testContainerInstanceArn), &config.Config{Cluster: testClusterArn})
 
 	w := httptest.NewRecorder()
-	req, _ := http.NewRequest("GET", "http://localhost:"+strconv.Itoa(config.AGENT_INTROSPECTION_PORT), nil)
+	req, _ := http.NewRequest("GET", "http://localhost:"+strconv.Itoa(config.AgentIntrospectionPort), nil)
 	metadataHandler(w, req)
 
 	var resp MetadataResponse
@@ -78,11 +78,11 @@ func TestGetTaskByDockerID(t *testing.T) {
 	taskDiffHelper(t, []*api.Task{testTasks[1]}, TasksResponse{Tasks: []*TaskResponse{&taskResponse}})
 }
 
-func TestGetTaskByDockerID400(t *testing.T) {
+func TestGetTaskByDockerID404(t *testing.T) {
 	recorder := performMockRequest(t, "/v1/tasks?dockerid=does-not-exist")
 
-	if recorder.Code != 400 {
-		t.Error("API did not return 400 for bad dockerid")
+	if recorder.Code != 404 {
+		t.Error("API did not return 404 for bad dockerid")
 	}
 }
 
@@ -98,19 +98,19 @@ func TestGetTaskByTaskArn(t *testing.T) {
 	taskDiffHelper(t, []*api.Task{testTasks[0]}, TasksResponse{Tasks: []*TaskResponse{&taskResponse}})
 }
 
-func TestGetTaskByTaskArn400(t *testing.T) {
+func TestGetTaskByTaskArnNotFound(t *testing.T) {
 	recorder := performMockRequest(t, "/v1/tasks?taskarn=doesnotexist")
 
-	if recorder.Code != 400 {
-		t.Errorf("Expected 400 for bad taskarn")
+	if recorder.Code != http.StatusNotFound {
+		t.Errorf("Expected %d for bad taskarn, but was %d", http.StatusNotFound, recorder.Code)
 	}
 }
 
-func TestGetTaskByTaskArnAndDockerID400(t *testing.T) {
+func TestGetTaskByTaskArnAndDockerIDBadRequest(t *testing.T) {
 	recorder := performMockRequest(t, "/v1/tasks?taskarn=task2&dockerid=foo")
 
-	if recorder.Code != 400 {
-		t.Errorf("Expected 400 for both arn and dockerid")
+	if recorder.Code != http.StatusBadRequest {
+		t.Errorf("Expected %d for both arn and dockerid, but was %d", http.StatusBadRequest, recorder.Code)
 	}
 }
 
@@ -208,11 +208,12 @@ func taskDiffHelper(t *testing.T, expected []*api.Task, actual TasksResponse) {
 			continue
 		}
 
-		if respTask.DesiredStatus != task.DesiredStatus.String() {
-			t.Errorf("DesiredStatus mismatch: %v != %v", respTask.DesiredStatus, task.DesiredStatus)
+		if respTask.DesiredStatus != task.GetDesiredStatus().String() {
+			t.Errorf("DesiredStatus mismatch: %v != %v", respTask.DesiredStatus, task.GetDesiredStatus())
 		}
-		if respTask.KnownStatus != task.KnownStatus.String() {
-			t.Errorf("KnownStatus mismatch: %v != %v", respTask.KnownStatus, task.KnownStatus)
+		taskKnownStatus := task.GetKnownStatus().String()
+		if respTask.KnownStatus != taskKnownStatus {
+			t.Errorf("KnownStatus mismatch: %v != %v", respTask.KnownStatus, taskKnownStatus)
 		}
 
 		if respTask.Family != task.Family || respTask.Version != task.Version {

@@ -1,4 +1,4 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -123,11 +123,13 @@ func NewECSClient(credentialProvider *credentials.Credentials, config *config.Co
 
 func getCpuAndMemory() (int64, int64) {
 	memInfo, err := system.ReadMemInfo()
-	mem := memInfo.MemTotal / 1024 / 1024 // MiB
-	if err != nil {
+	mem := int64(0)
+	if err == nil {
+		mem = memInfo.MemTotal / 1024 / 1024 // MiB
+	} else {
 		log.Error("Unable to get memory info", "err", err)
-		mem = 0
 	}
+
 	cpu := runtime.NumCPU() * 1024
 
 	return int64(cpu), mem
@@ -148,7 +150,7 @@ func (client *ApiECSClient) RegisterContainerInstance(containerInstanceArn strin
 	clusterRef := client.config.Cluster
 	// If our clusterRef is empty, we should try to create the default
 	if clusterRef == "" {
-		clusterRef = config.DEFAULT_CLUSTER_NAME
+		clusterRef = config.DefaultClusterName
 		defer func() {
 			// Update the config value to reflect the cluster we end up in
 			client.config.Cluster = clusterRef

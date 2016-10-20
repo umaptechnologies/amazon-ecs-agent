@@ -1,4 +1,4 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -32,16 +32,21 @@ import (
 
 var log = logger.ForModule("Handlers")
 
-const statusBadRequest = 400
-const statusNotImplemented = 501
-const statusOK = 200
-const statusInternalServerError = 500
-
-const dockerIdQueryField = "dockerid"
-const taskArnQueryField = "taskarn"
+const (
+	dockerIdQueryField = "dockerid"
+	taskArnQueryField  = "taskarn"
+)
 
 type rootResponse struct {
 	AvailableCommands []string
+}
+
+// ValueFromRequest returns the value of a field in the http request. The boolean value is
+// set to true if the field exists in the query.
+func ValueFromRequest(r *http.Request, field string) (string, bool) {
+	values := r.URL.Query()
+	_, exists := values[field]
+	return values.Get(field), exists
 }
 
 func metadataV1RequestHandlerMaker(containerInstanceArn *string, cfg *config.Config) func(http.ResponseWriter, *http.Request) {
@@ -66,17 +71,19 @@ func newTaskResponse(task *api.Task, containerMap map[string]*api.DockerContaine
 		containers = append(containers, ContainerResponse{container.DockerId, container.DockerName, containerName})
 	}
 
-	knownStatus := task.KnownStatus.BackendStatus()
-	desiredStatus := task.DesiredStatus.BackendStatus()
+	knownStatus := task.GetKnownStatus()
+	knownBackendStatus := knownStatus.BackendStatus()
+	desiredStatusInAgent := task.GetDesiredStatus()
+	desiredStatus := desiredStatusInAgent.BackendStatus()
 
-	if (knownStatus == "STOPPED" && desiredStatus != "STOPPED") || (knownStatus == "RUNNING" && desiredStatus == "PENDING") {
+	if (knownBackendStatus == "STOPPED" && desiredStatus != "STOPPED") || (knownBackendStatus == "RUNNING" && desiredStatus == "PENDING") {
 		desiredStatus = ""
 	}
 
 	return &TaskResponse{
 		Arn:           task.Arn,
 		DesiredStatus: desiredStatus,
-		KnownStatus:   knownStatus,
+		KnownStatus:   knownBackendStatus,
 		Family:        task.Family,
 		Version:       task.Version,
 		Containers:    containers,
@@ -94,25 +101,17 @@ func newTasksResponse(state *dockerstate.DockerTaskEngineState) *TasksResponse {
 	return &TasksResponse{Tasks: taskResponses}
 }
 
-// Returns the value of a field in the http request. The boolean value is
-// set to true if the field exists in the query.
-func valueFromRequest(r *http.Request, field string) (string, bool) {
-	values := r.URL.Query()
-	_, exists := values[field]
-	return values.Get(field), exists
-}
-
 // Creates JSON response and sets the http status code for the task queried.
 func createTaskJSONResponse(task *api.Task, found bool, resourceId string, state *dockerstate.DockerTaskEngineState) ([]byte, int) {
 	var responseJSON []byte
-	status := statusOK
+	status := http.StatusOK
 	if found {
 		containerMap, _ := state.ContainerMapByArn(task.Arn)
 		responseJSON, _ = json.Marshal(newTaskResponse(task, containerMap))
 	} else {
 		log.Warn("Could not find requsted resource: " + resourceId)
 		responseJSON, _ = json.Marshal(&TaskResponse{})
-		status = statusBadRequest
+		status = http.StatusNotFound
 	}
 	return responseJSON, status
 }
@@ -124,12 +123,12 @@ func tasksV1RequestHandlerMaker(taskEngine DockerStateResolver) func(http.Respon
 	return func(w http.ResponseWriter, r *http.Request) {
 		var responseJSON []byte
 		dockerTaskEngineState := taskEngine.State()
-		dockerId, dockerIdExists := valueFromRequest(r, dockerIdQueryField)
-		taskArn, taskArnExists := valueFromRequest(r, taskArnQueryField)
+		dockerId, dockerIdExists := ValueFromRequest(r, dockerIdQueryField)
+		taskArn, taskArnExists := ValueFromRequest(r, taskArnQueryField)
 		var status int
 		if dockerIdExists && taskArnExists {
 			log.Info("Request contains both ", dockerIdQueryField, " and ", taskArnQueryField, ". Expect at most one of these.")
-			w.WriteHeader(statusBadRequest)
+			w.WriteHeader(http.StatusBadRequest)
 			w.Write(responseJSON)
 			return
 		}
@@ -192,7 +191,7 @@ func setupServer(containerInstanceArn *string, taskEngine DockerStateResolver, c
 	loggingServeMux.Handle("/", LoggingHandler{serverMux})
 
 	server := http.Server{
-		Addr:         ":" + strconv.Itoa(config.AGENT_INTROSPECTION_PORT),
+		Addr:         ":" + strconv.Itoa(config.AgentIntrospectionPort),
 		Handler:      loggingServeMux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,

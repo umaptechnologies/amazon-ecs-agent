@@ -1,4 +1,5 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// +build !integration
+// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -14,7 +15,6 @@
 package engine
 
 import (
-	"errors"
 	"reflect"
 	"sync"
 	"testing"
@@ -22,30 +22,53 @@ import (
 
 	"github.com/aws/amazon-ecs-agent/agent/api"
 	"github.com/aws/amazon-ecs-agent/agent/config"
+	"github.com/aws/amazon-ecs-agent/agent/credentials"
+	"github.com/aws/amazon-ecs-agent/agent/credentials/mocks"
 	"github.com/aws/amazon-ecs-agent/agent/engine/dockerclient"
+	"github.com/aws/amazon-ecs-agent/agent/engine/dockerstate"
 	"github.com/aws/amazon-ecs-agent/agent/engine/testdata"
+	"github.com/aws/amazon-ecs-agent/agent/eventstream"
 	"github.com/aws/amazon-ecs-agent/agent/statemanager/mocks"
-	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
+	"github.com/aws/amazon-ecs-agent/agent/utils/ttime/mocks"
+	"github.com/aws/aws-sdk-go/aws"
+	docker "github.com/fsouza/go-dockerclient"
 	"github.com/golang/mock/gomock"
+
+	"golang.org/x/net/context"
 )
 
-var dte_test_time = ttime.NewTestTime()
+const credentialsId = "credsid"
+
 var defaultConfig = config.DefaultConfig()
 
-func mocks(t *testing.T, cfg *config.Config) (*gomock.Controller, *MockDockerClient, TaskEngine) {
+func mocks(t *testing.T, cfg *config.Config) (*gomock.Controller, *MockDockerClient, *mock_ttime.MockTime, TaskEngine, *mock_credentials.MockManager, *MockImageManager) {
 	ctrl := gomock.NewController(t)
 	client := NewMockDockerClient(ctrl)
-	taskEngine := NewTaskEngine(cfg, false)
-	taskEngine.(*DockerTaskEngine).SetDockerClient(client)
-	return ctrl, client, taskEngine
+	mockTime := mock_ttime.NewMockTime(ctrl)
+	credentialsManager := mock_credentials.NewMockManager(ctrl)
+
+	containerChangeEventStream := eventstream.NewEventStream("TESTTASKENGINE", context.Background())
+	containerChangeEventStream.StartListening()
+	imageManager := NewMockImageManager(ctrl)
+	taskEngine := NewTaskEngine(cfg, client, credentialsManager, containerChangeEventStream, imageManager, dockerstate.NewDockerTaskEngineState())
+	taskEngine.(*DockerTaskEngine)._time = mockTime
+	return ctrl, client, mockTime, taskEngine, credentialsManager, imageManager
 }
 
 func TestBatchContainerHappyPath(t *testing.T) {
-	ctrl, client, taskEngine := mocks(t, &defaultConfig)
+
+	ctrl, client, mockTime, taskEngine, credentialsManager, imageManager := mocks(t, &defaultConfig)
+
 	defer ctrl.Finish()
-	ttime.SetTime(dte_test_time)
+
+	roleCredentials := &credentials.TaskIAMRoleCredentials{
+		IAMRoleCredentials: credentials.IAMRoleCredentials{CredentialsId: "credsid"},
+	}
+	credentialsManager.EXPECT().GetTaskCredentials(credentialsId).Return(roleCredentials, true).AnyTimes()
+	credentialsManager.EXPECT().RemoveCredentials(credentialsId)
 
 	sleepTask := testdata.LoadTask("sleep5")
+	sleepTask.SetCredentialsId(credentialsId)
 
 	eventStream := make(chan DockerContainerChangeEvent)
 	eventsReported := sync.WaitGroup{}
@@ -58,14 +81,33 @@ func TestBatchContainerHappyPath(t *testing.T) {
 	}
 
 	client.EXPECT().ContainerEvents(gomock.Any()).Return(eventStream, nil)
+	var createdContainerName string
 	for _, container := range sleepTask.Containers {
+		imageManager.EXPECT().AddAllImageStates(gomock.Any()).AnyTimes()
 		client.EXPECT().PullImage(container.Image, nil).Return(DockerContainerMetadata{})
-
+		imageManager.EXPECT().AddContainerReferenceToImageState(container).Return(nil)
+		imageManager.EXPECT().GetImageStateFromImageName(gomock.Any()).Return(nil)
 		dockerConfig, err := sleepTask.DockerConfig(container)
+		// Container config should get updated with this during PostUnmarshalTask
+		credentialsEndpointEnvValue := roleCredentials.IAMRoleCredentials.GenerateCredentialsEndpointRelativeURI()
+		dockerConfig.Env = append(dockerConfig.Env, "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI="+credentialsEndpointEnvValue)
 		if err != nil {
 			t.Fatal(err)
 		}
-		client.EXPECT().CreateContainer(dockerConfig, gomock.Any(), gomock.Any()).Do(func(x, y, z interface{}) {
+		// Container config should get updated with this during CreateContainer
+		dockerConfig.Labels["com.amazonaws.ecs.task-arn"] = sleepTask.Arn
+		dockerConfig.Labels["com.amazonaws.ecs.container-name"] = container.Name
+		dockerConfig.Labels["com.amazonaws.ecs.task-definition-family"] = sleepTask.Family
+		dockerConfig.Labels["com.amazonaws.ecs.task-definition-version"] = sleepTask.Version
+		dockerConfig.Labels["com.amazonaws.ecs.cluster"] = ""
+		client.EXPECT().CreateContainer(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(config *docker.Config, y interface{}, containerName string) {
+
+			if !reflect.DeepEqual(dockerConfig, config) {
+				t.Errorf("Mismatch in container config; expected: %v, got: %v", dockerConfig, config)
+			}
+			// sleep5 task contains only one container. Just assign
+			// the containerName to createdContainerName
+			createdContainerName = containerName
 			eventsReported.Add(1)
 			go func() {
 				eventStream <- dockerEvent(api.ContainerCreated)
@@ -81,6 +123,12 @@ func TestBatchContainerHappyPath(t *testing.T) {
 			}()
 		}).Return(DockerContainerMetadata{DockerId: "containerId"})
 	}
+
+	steadyStateVerify := make(chan time.Time, 1)
+	cleanup := make(chan time.Time, 1)
+	mockTime.EXPECT().Now().Do(func() time.Time { return time.Now() }).AnyTimes()
+	mockTime.EXPECT().After(steadyStateTaskVerifyInterval).Return(steadyStateVerify).AnyTimes()
+	mockTime.EXPECT().After(gomock.Any()).Return(cleanup).AnyTimes()
 
 	err := taskEngine.Init()
 	taskEvents, contEvents := taskEngine.TaskEvents()
@@ -111,6 +159,7 @@ func TestBatchContainerHappyPath(t *testing.T) {
 	exitCode := 0
 	// And then docker reports that sleep died, as sleep is wont to do
 	eventStream <- DockerContainerChangeEvent{Status: api.ContainerStopped, DockerContainerMetadata: DockerContainerMetadata{DockerId: "containerId", ExitCode: &exitCode}}
+	steadyStateVerify <- time.Now()
 
 	if cont := <-contEvents; cont.Status != api.ContainerStopped {
 		t.Fatal("Expected container to stop first")
@@ -127,17 +176,24 @@ func TestBatchContainerHappyPath(t *testing.T) {
 	go func() { eventStream <- dockerEvent(api.ContainerStopped) }()
 
 	sleepTaskStop := testdata.LoadTask("sleep5")
-	sleepTaskStop.DesiredStatus = api.TaskStopped
+	sleepTaskStop.SetCredentialsId(credentialsId)
+	sleepTaskStop.SetDesiredStatus(api.TaskStopped)
 	taskEngine.AddTask(sleepTaskStop)
 	// As above, duplicate events should not be a problem
 	taskEngine.AddTask(sleepTaskStop)
 	taskEngine.AddTask(sleepTaskStop)
 
-	// Expect a bunch of steady state 'poll' describes when we warp 4 hours
+	// Expect a bunch of steady state 'poll' describes when we trigger cleanup
 	client.EXPECT().DescribeContainer(gomock.Any()).AnyTimes()
-	client.EXPECT().RemoveContainer("containerId").Return(nil)
+	client.EXPECT().RemoveContainer(gomock.Any()).Do(func(removedContainerName string) {
+		if createdContainerName != removedContainerName {
+			t.Errorf("Container name mismatch, created: %s, removed: %s", createdContainerName, removedContainerName)
+		}
+	}).Return(nil)
 
-	dte_test_time.Warp(4 * time.Hour)
+	imageManager.EXPECT().RemoveContainerReferenceFromImageState(gomock.Any())
+	// trigger cleanup
+	cleanup <- time.Now()
 	go func() { eventStream <- dockerEvent(api.ContainerStopped) }()
 
 	// Wait for the task to actually be dead; if we just fallthrough immediately,
@@ -152,9 +208,8 @@ func TestBatchContainerHappyPath(t *testing.T) {
 }
 
 func TestRemoveEvents(t *testing.T) {
-	ctrl, client, taskEngine := mocks(t, &defaultConfig)
+	ctrl, client, testTime, taskEngine, _, imageManager := mocks(t, &defaultConfig)
 	defer ctrl.Finish()
-	ttime.SetTime(dte_test_time)
 
 	sleepTask := testdata.LoadTask("sleep5")
 
@@ -169,9 +224,16 @@ func TestRemoveEvents(t *testing.T) {
 	}
 
 	client.EXPECT().ContainerEvents(gomock.Any()).Return(eventStream, nil)
+	var createdContainerName string
 	for _, container := range sleepTask.Containers {
+		imageManager.EXPECT().AddAllImageStates(gomock.Any()).AnyTimes()
 		client.EXPECT().PullImage(container.Image, nil).Return(DockerContainerMetadata{})
-		client.EXPECT().CreateContainer(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(x, y, z interface{}) {
+		imageManager.EXPECT().AddContainerReferenceToImageState(container)
+		imageManager.EXPECT().GetImageStateFromImageName(gomock.Any()).Return(nil)
+		client.EXPECT().CreateContainer(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(x, y interface{}, containerName string) {
+			// sleep5 task contains only one container. Just assign
+			// the containerName to createdContainerName
+			createdContainerName = containerName
 			eventsReported.Add(1)
 			go func() {
 				eventStream <- dockerEvent(api.ContainerCreated)
@@ -187,6 +249,12 @@ func TestRemoveEvents(t *testing.T) {
 			}()
 		}).Return(DockerContainerMetadata{DockerId: "containerId"})
 	}
+
+	steadyStateVerify := make(chan time.Time, 1)
+	cleanup := make(chan time.Time, 1)
+	testTime.EXPECT().Now().Do(func() time.Time { return time.Now() }).AnyTimes()
+	testTime.EXPECT().After(steadyStateTaskVerifyInterval).Return(steadyStateVerify).AnyTimes()
+	testTime.EXPECT().After(gomock.Any()).Return(cleanup).AnyTimes()
 
 	err := taskEngine.Init()
 	taskEvents, contEvents := taskEngine.TaskEvents()
@@ -217,6 +285,7 @@ func TestRemoveEvents(t *testing.T) {
 	exitCode := 0
 	// And then docker reports that sleep died, as sleep is wont to do
 	eventStream <- DockerContainerChangeEvent{Status: api.ContainerStopped, DockerContainerMetadata: DockerContainerMetadata{DockerId: "containerId", ExitCode: &exitCode}}
+	steadyStateVerify <- time.Now()
 
 	if cont := <-contEvents; cont.Status != api.ContainerStopped {
 		t.Fatal("Expected container to stop first")
@@ -229,18 +298,23 @@ func TestRemoveEvents(t *testing.T) {
 	}
 
 	sleepTaskStop := testdata.LoadTask("sleep5")
-	sleepTaskStop.DesiredStatus = api.TaskStopped
+	sleepTaskStop.SetDesiredStatus(api.TaskStopped)
 	taskEngine.AddTask(sleepTaskStop)
 
 	// Expect a bunch of steady state 'poll' describes when we warp 4 hours
 	client.EXPECT().DescribeContainer(gomock.Any()).AnyTimes()
-	client.EXPECT().RemoveContainer("containerId").Do(func(x interface{}) {
+	client.EXPECT().RemoveContainer(gomock.Any()).Do(func(removedContainerName string) {
+		if createdContainerName != removedContainerName {
+			t.Errorf("Container name mismatch, created: %s, removed: %s", createdContainerName, removedContainerName)
+		}
 		// Emit a couple events for the task before the remove finishes; make sure this gets handled appropriately
 		eventStream <- dockerEvent(api.ContainerStopped)
 		eventStream <- dockerEvent(api.ContainerStopped)
 	}).Return(nil)
 
-	dte_test_time.Warp(4 * time.Hour)
+	imageManager.EXPECT().RemoveContainerReferenceFromImageState(gomock.Any())
+	// trigger cleanup
+	cleanup <- time.Now()
 
 	for {
 		tasks, _ := taskEngine.(*DockerTaskEngine).ListTasks()
@@ -253,13 +327,13 @@ func TestRemoveEvents(t *testing.T) {
 }
 
 func TestStartTimeoutThenStart(t *testing.T) {
-	ctrl, client, taskEngine := mocks(t, &defaultConfig)
+	ctrl, client, testTime, taskEngine, _, imageManager := mocks(t, &defaultConfig)
 	defer ctrl.Finish()
-	ttime.SetTime(dte_test_time)
 
 	sleepTask := testdata.LoadTask("sleep5")
 
 	eventStream := make(chan DockerContainerChangeEvent)
+	testTime.EXPECT().After(gomock.Any())
 
 	dockerEvent := func(status api.ContainerStatus) DockerContainerChangeEvent {
 		meta := DockerContainerMetadata{
@@ -270,13 +344,23 @@ func TestStartTimeoutThenStart(t *testing.T) {
 
 	client.EXPECT().ContainerEvents(gomock.Any()).Return(eventStream, nil)
 	for _, container := range sleepTask.Containers {
-
+		imageManager.EXPECT().AddAllImageStates(gomock.Any()).AnyTimes()
 		client.EXPECT().PullImage(container.Image, nil).Return(DockerContainerMetadata{})
 
+		imageManager.EXPECT().AddContainerReferenceToImageState(container)
+		imageManager.EXPECT().GetImageStateFromImageName(gomock.Any()).Return(nil)
 		dockerConfig, err := sleepTask.DockerConfig(container)
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		// Container config should get updated with this during CreateContainer
+		dockerConfig.Labels["com.amazonaws.ecs.task-arn"] = sleepTask.Arn
+		dockerConfig.Labels["com.amazonaws.ecs.container-name"] = container.Name
+		dockerConfig.Labels["com.amazonaws.ecs.task-definition-family"] = sleepTask.Family
+		dockerConfig.Labels["com.amazonaws.ecs.task-definition-version"] = sleepTask.Version
+		dockerConfig.Labels["com.amazonaws.ecs.cluster"] = ""
+
 		client.EXPECT().CreateContainer(dockerConfig, gomock.Any(), gomock.Any()).Do(func(x, y, z interface{}) {
 			go func() { eventStream <- dockerEvent(api.ContainerCreated) }()
 		}).Return(DockerContainerMetadata{DockerId: "containerId"})
@@ -285,8 +369,8 @@ func TestStartTimeoutThenStart(t *testing.T) {
 
 		// Expect it to try to stop the container before going on;
 		// in the future the agent might optimize to not stop unless the known
-		// status is running, at which poitn this can be safeuly removed
-		client.EXPECT().StopContainer("containerId").Return(DockerContainerMetadata{Error: errors.New("Cannot start")})
+		// status is running, at which point this can be safely removed
+		client.EXPECT().StopContainer("containerId").Return(DockerContainerMetadata{Error: CannotXContainerError{transition: "start", msg: "Cannot start"}})
 	}
 
 	err := taskEngine.Init()
@@ -318,7 +402,7 @@ func TestStartTimeoutThenStart(t *testing.T) {
 	}
 
 	// Expect it to try to stop it once now
-	client.EXPECT().StopContainer("containerId").Return(DockerContainerMetadata{Error: errors.New("Cannot start")})
+	client.EXPECT().StopContainer("containerId").Return(DockerContainerMetadata{Error: CannotXContainerError{transition: "start", msg: "Cannot start"}}).AnyTimes()
 	// Now surprise surprise, it actually did start!
 	eventStream <- dockerEvent(api.ContainerRunning)
 
@@ -336,9 +420,8 @@ func TestStartTimeoutThenStart(t *testing.T) {
 }
 
 func TestSteadyStatePoll(t *testing.T) {
-	ctrl, client, taskEngine := mocks(t, &config.Config{})
+	ctrl, client, testTime, taskEngine, _, imageManager := mocks(t, &defaultConfig)
 	defer ctrl.Finish()
-	ttime.SetTime(dte_test_time)
 
 	sleepTask := testdata.LoadTask("sleep5")
 
@@ -353,13 +436,21 @@ func TestSteadyStatePoll(t *testing.T) {
 
 	client.EXPECT().ContainerEvents(gomock.Any()).Return(eventStream, nil)
 	for _, container := range sleepTask.Containers {
-
+		imageManager.EXPECT().AddAllImageStates(gomock.Any()).AnyTimes()
 		client.EXPECT().PullImage(container.Image, nil).Return(DockerContainerMetadata{})
-
+		imageManager.EXPECT().AddContainerReferenceToImageState(container)
+		imageManager.EXPECT().GetImageStateFromImageName(gomock.Any()).Return(nil)
 		dockerConfig, err := sleepTask.DockerConfig(container)
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Container config should get updated with this during CreateContainer
+		dockerConfig.Labels["com.amazonaws.ecs.task-arn"] = sleepTask.Arn
+		dockerConfig.Labels["com.amazonaws.ecs.container-name"] = container.Name
+		dockerConfig.Labels["com.amazonaws.ecs.task-definition-family"] = sleepTask.Family
+		dockerConfig.Labels["com.amazonaws.ecs.task-definition-version"] = sleepTask.Version
+		dockerConfig.Labels["com.amazonaws.ecs.cluster"] = ""
+
 		client.EXPECT().CreateContainer(dockerConfig, gomock.Any(), gomock.Any()).Do(func(x, y, z interface{}) {
 			go func() { eventStream <- dockerEvent(api.ContainerCreated) }()
 		}).Return(DockerContainerMetadata{DockerId: "containerId"})
@@ -369,6 +460,9 @@ func TestSteadyStatePoll(t *testing.T) {
 		}).Return(DockerContainerMetadata{DockerId: "containerId"})
 	}
 
+	steadyStateVerify := make(chan time.Time, 10)
+	testTime.EXPECT().After(steadyStateTaskVerifyInterval).Return(steadyStateVerify).AnyTimes()
+	testTime.EXPECT().After(gomock.Any()).AnyTimes()
 	err := taskEngine.Init()
 	taskEvents, contEvents := taskEngine.TaskEvents()
 	if err != nil {
@@ -394,14 +488,13 @@ func TestSteadyStatePoll(t *testing.T) {
 	// Two steady state oks, one stop
 	gomock.InOrder(
 		client.EXPECT().DescribeContainer("containerId").Return(api.ContainerRunning, DockerContainerMetadata{DockerId: "containerId"}).Times(2),
-		client.EXPECT().DescribeContainer("containerId").Return(api.ContainerStopped, DockerContainerMetadata{DockerId: "containerId"}),
+		// TODO change AnyTimes() to MinTimes(1) after updating gomock
+		client.EXPECT().DescribeContainer("containerId").Return(api.ContainerStopped, DockerContainerMetadata{DockerId: "containerId"}).AnyTimes(),
 	)
-	// Due to how the mock time works, we actually have to warp 10 minutes per
-	// steady-state event. That's 10 per timeout + 10 per describe * 1 container.
-	// The reason for this is the '.After' call happens regardless of whether the
-	// value gets read, and the test sleep will add that time to elapsed, even
-	// though in real-time-units that much time would not have elapsed.
-	dte_test_time.Warp(60 * time.Minute)
+	for i := 0; i < 10; i++ {
+		steadyStateVerify <- time.Now()
+	}
+	close(steadyStateVerify)
 
 	contEvent := <-contEvents
 	if contEvent.Status != api.ContainerStopped {
@@ -417,12 +510,16 @@ func TestSteadyStatePoll(t *testing.T) {
 		t.Fatal("Should be out of events")
 	default:
 	}
+	// cleanup expectations
+	testTime.EXPECT().Now().AnyTimes()
+	testTime.EXPECT().After(gomock.Any()).AnyTimes()
 }
 
 func TestStopWithPendingStops(t *testing.T) {
-	ctrl, client, taskEngine := mocks(t, &config.Config{})
+	ctrl, client, testTime, taskEngine, _, imageManager := mocks(t, &defaultConfig)
 	defer ctrl.Finish()
-	ttime.SetTime(dte_test_time)
+	testTime.EXPECT().Now().AnyTimes()
+	testTime.EXPECT().After(gomock.Any()).AnyTimes()
 
 	sleepTask1 := testdata.LoadTask("sleep5")
 	sleepTask1.StartSequenceNumber = 5
@@ -432,7 +529,6 @@ func TestStopWithPendingStops(t *testing.T) {
 	eventStream := make(chan DockerContainerChangeEvent)
 
 	client.EXPECT().ContainerEvents(gomock.Any()).Return(eventStream, nil)
-
 	err := taskEngine.Init()
 	if err != nil {
 		t.Fatal(err)
@@ -449,27 +545,35 @@ func TestStopWithPendingStops(t *testing.T) {
 		}
 	}()
 
-	pulling := make(chan bool)
+	pullDone := make(chan bool)
+	pullInvoked := make(chan bool)
 	client.EXPECT().PullImage(gomock.Any(), nil).Do(func(x, y interface{}) {
-		<-pulling
+		pullInvoked <- true
+		<-pullDone
 	})
+
+	imageManager.EXPECT().AddContainerReferenceToImageState(gomock.Any()).AnyTimes()
+	imageManager.EXPECT().GetImageStateFromImageName(gomock.Any()).AnyTimes()
+
 	taskEngine.AddTask(sleepTask2)
+	<-pullInvoked
 	stopSleep2 := *sleepTask2
-	stopSleep2.DesiredStatus = api.TaskStopped
+	stopSleep2.SetDesiredStatus(api.TaskStopped)
 	stopSleep2.StopSequenceNumber = 4
 	taskEngine.AddTask(&stopSleep2)
 
 	taskEngine.AddTask(sleepTask1)
 	stopSleep1 := *sleepTask1
-	stopSleep1.DesiredStatus = api.TaskStopped
+	stopSleep1.SetDesiredStatus(api.TaskStopped)
 	stopSleep1.StopSequenceNumber = 5
 	taskEngine.AddTask(&stopSleep1)
-	pulling <- true
-	// If we get here without deadlocking, we passed the test
+	pullDone <- true
+	// this means the PullImage is only called once due to the task is stopped before it
+	// gets the pull image lock
 }
 
 func TestCreateContainerForceSave(t *testing.T) {
-	ctrl, client, privateTaskEngine := mocks(t, &config.Config{})
+	ctrl, client, _, privateTaskEngine, _, _ := mocks(t, &config.Config{})
 	saver := mock_statemanager.NewMockStateManager(ctrl)
 	defer ctrl.Finish()
 	taskEngine, _ := privateTaskEngine.(*DockerTaskEngine)
@@ -499,6 +603,130 @@ func TestCreateContainerForceSave(t *testing.T) {
 	}
 }
 
+func TestCreateContainerMergesLabels(t *testing.T) {
+	ctrl, client, _, taskEngine, _, _ := mocks(t, &defaultConfig)
+	defer ctrl.Finish()
+
+	testTask := &api.Task{
+		Arn:     "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		Family:  "myFamily",
+		Version: "1",
+		Containers: []*api.Container{
+			&api.Container{
+				Name: "c1",
+				DockerConfig: api.DockerConfig{
+					Config: aws.String(`{"Labels":{"key":"value"}}`),
+				},
+			},
+		},
+	}
+	expectedConfig, err := testTask.DockerConfig(testTask.Containers[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedConfig.Labels = map[string]string{
+		"com.amazonaws.ecs.task-arn":                "arn:aws:ecs:us-east-1:012345678910:task/c09f0188-7f87-4b0f-bfc3-16296622b6fe",
+		"com.amazonaws.ecs.container-name":          "c1",
+		"com.amazonaws.ecs.task-definition-family":  "myFamily",
+		"com.amazonaws.ecs.task-definition-version": "1",
+		"com.amazonaws.ecs.cluster":                 "",
+		"key": "value",
+	}
+	client.EXPECT().CreateContainer(expectedConfig, gomock.Any(), gomock.Any())
+	taskEngine.(*DockerTaskEngine).createContainer(testTask, testTask.Containers[0])
+}
+
+// TestTaskTransitionWhenStopContainerTimesout tests that task transitions to stopped
+// only when terminal events are recieved from docker event stream when
+// StopContainer times out
+func TestTaskTransitionWhenStopContainerTimesout(t *testing.T) {
+	ctrl, client, mockTime, taskEngine, _, imageManager := mocks(t, &defaultConfig)
+	defer ctrl.Finish()
+
+	sleepTask := testdata.LoadTask("sleep5")
+
+	eventStream := make(chan DockerContainerChangeEvent)
+
+	dockerEvent := func(status api.ContainerStatus) DockerContainerChangeEvent {
+		meta := DockerContainerMetadata{
+			DockerId: "containerId",
+		}
+		return DockerContainerChangeEvent{Status: status, DockerContainerMetadata: meta}
+	}
+
+	client.EXPECT().ContainerEvents(gomock.Any()).Return(eventStream, nil)
+	mockTime.EXPECT().After(gomock.Any()).AnyTimes()
+	containerStopTimeoutError := DockerContainerMetadata{Error: &DockerTimeoutError{transition: "stop", duration: stopContainerTimeout}}
+	for _, container := range sleepTask.Containers {
+		imageManager.EXPECT().AddAllImageStates(gomock.Any()).AnyTimes()
+		client.EXPECT().PullImage(container.Image, nil).Return(DockerContainerMetadata{})
+		imageManager.EXPECT().AddContainerReferenceToImageState(container)
+		imageManager.EXPECT().GetImageStateFromImageName(gomock.Any()).Return(nil)
+		dockerConfig, err := sleepTask.DockerConfig(container)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Container config should get updated with this during CreateContainer
+		dockerConfig.Labels["com.amazonaws.ecs.task-arn"] = sleepTask.Arn
+		dockerConfig.Labels["com.amazonaws.ecs.container-name"] = container.Name
+		dockerConfig.Labels["com.amazonaws.ecs.task-definition-family"] = sleepTask.Family
+		dockerConfig.Labels["com.amazonaws.ecs.task-definition-version"] = sleepTask.Version
+		dockerConfig.Labels["com.amazonaws.ecs.cluster"] = ""
+
+		client.EXPECT().CreateContainer(dockerConfig, gomock.Any(), gomock.Any()).Do(func(x, y, z interface{}) {
+			go func() { eventStream <- dockerEvent(api.ContainerCreated) }()
+		}).Return(DockerContainerMetadata{DockerId: "containerId"})
+
+		// StartContainer returns timeout error. This should cause the engine
+		// to transition the task to STOPPED and to stop all containers of
+		// the task
+		client.EXPECT().StartContainer("containerId").Return(DockerContainerMetadata{Error: &DockerTimeoutError{}})
+
+		gomock.InOrder(
+			// StopContainer times out as well
+			client.EXPECT().StopContainer("containerId").Do(func(id string) {
+				// Simulate docker actually stopping the container even though
+				// StopContainer in container engine times out
+				go func() {
+					eventStream <- dockerEvent(api.ContainerStopped)
+				}()
+			}).Return(containerStopTimeoutError),
+			// Since task is not in steady state, progressContainers causes
+			// another invocation of StopContainer. Return a timeout error
+			// for that as well
+			// TODO change AnyTimes() to MinTimes(1) after updating gomock
+			client.EXPECT().StopContainer("containerId").Return(containerStopTimeoutError).AnyTimes(),
+		)
+	}
+
+	err := taskEngine.Init()
+	taskEvents, contEvents := taskEngine.TaskEvents()
+	if err != nil {
+		t.Fatalf("Error getting event streams from engine: %v", err)
+	}
+
+	taskEngine.AddTask(sleepTask)
+
+	// Expect it to go to stopped
+	contEvent := <-contEvents
+	if contEvent.Status != api.ContainerStopped {
+		t.Errorf("Expected container to timeout on start and stop, got: %v", contEvent)
+	}
+	*contEvent.SentStatus = api.ContainerStopped
+
+	taskEvent := <-taskEvents
+	if taskEvent.Status != api.TaskStopped {
+		t.Errorf("Expected task to be stopped, got: %v", taskEvent)
+	}
+	*taskEvent.SentStatus = api.TaskStopped
+	select {
+	case <-taskEvents:
+		t.Error("Should be out of events")
+	case <-contEvents:
+		t.Error("Should be out of events")
+	default:
+	}
+}
 func TestCapabilities(t *testing.T) {
 	conf := &config.Config{
 		AvailableLoggingDrivers: []dockerclient.LoggingDriver{
@@ -513,7 +741,7 @@ func TestCapabilities(t *testing.T) {
 		AppArmorCapable:         true,
 		TaskCleanupWaitDuration: config.DefaultConfig().TaskCleanupWaitDuration,
 	}
-	ctrl, client, taskEngine := mocks(t, conf)
+	ctrl, client, _, taskEngine, _, _ := mocks(t, conf)
 	defer ctrl.Finish()
 
 	client.EXPECT().SupportedVersions().Return([]dockerclient.DockerVersion{
@@ -540,7 +768,7 @@ func TestCapabilities(t *testing.T) {
 
 func TestCapabilitiesECR(t *testing.T) {
 	conf := &config.Config{}
-	ctrl, client, taskEngine := mocks(t, conf)
+	ctrl, client, _, taskEngine, _, _ := mocks(t, conf)
 	defer ctrl.Finish()
 
 	client.EXPECT().SupportedVersions().Return([]dockerclient.DockerVersion{
@@ -559,17 +787,110 @@ func TestCapabilitiesECR(t *testing.T) {
 	}
 }
 
+func TestCapabilitiesTaskIAMRoleForSupportedDockerVersion(t *testing.T) {
+	conf := &config.Config{
+		TaskIAMRoleEnabled: true,
+	}
+	ctrl, client, _, taskEngine, _, _ := mocks(t, conf)
+	defer ctrl.Finish()
+
+	client.EXPECT().SupportedVersions().Return([]dockerclient.DockerVersion{
+		dockerclient.Version_1_19,
+	})
+
+	capabilities := taskEngine.Capabilities()
+	capMap := make(map[string]bool)
+	for _, capability := range capabilities {
+		capMap[capability] = true
+	}
+
+	if _, ok := capMap["com.amazonaws.ecs.capability.task-iam-role"]; !ok {
+		t.Errorf("Could not find iam capability when expected; got capabilities %v", capabilities)
+	}
+}
+
+func TestCapabilitiesTaskIAMRoleForUnSupportedDockerVersion(t *testing.T) {
+	conf := &config.Config{
+		TaskIAMRoleEnabled: true,
+	}
+	ctrl, client, _, taskEngine, _, _ := mocks(t, conf)
+	defer ctrl.Finish()
+
+	client.EXPECT().SupportedVersions().Return([]dockerclient.DockerVersion{
+		dockerclient.Version_1_18,
+	})
+
+	capabilities := taskEngine.Capabilities()
+	capMap := make(map[string]bool)
+	for _, capability := range capabilities {
+		capMap[capability] = true
+	}
+
+	if _, ok := capMap["com.amazonaws.ecs.capability.task-iam-role"]; ok {
+		t.Errorf("task-iam-role capability set for unsupported docker version")
+	}
+}
+
+func TestCapabilitiesTaskIAMRoleNetworkHostForSupportedDockerVersion(t *testing.T) {
+	conf := &config.Config{
+		TaskIAMRoleEnabledForNetworkHost: true,
+	}
+	ctrl, client, _, taskEngine, _, _ := mocks(t, conf)
+	defer ctrl.Finish()
+
+	client.EXPECT().SupportedVersions().Return([]dockerclient.DockerVersion{
+		dockerclient.Version_1_19,
+	})
+
+	capabilities := taskEngine.Capabilities()
+	capMap := make(map[string]bool)
+	for _, capability := range capabilities {
+		capMap[capability] = true
+	}
+
+	if _, ok := capMap["com.amazonaws.ecs.capability.task-iam-role-network-host"]; !ok {
+		t.Errorf("Could not find iam capability when expected; got capabilities %v", capabilities)
+	}
+}
+
+func TestCapabilitiesTaskIAMRoleNetworkHostForUnSupportedDockerVersion(t *testing.T) {
+	conf := &config.Config{
+		TaskIAMRoleEnabledForNetworkHost: true,
+	}
+	ctrl, client, _, taskEngine, _, _ := mocks(t, conf)
+	defer ctrl.Finish()
+
+	client.EXPECT().SupportedVersions().Return([]dockerclient.DockerVersion{
+		dockerclient.Version_1_18,
+	})
+
+	capabilities := taskEngine.Capabilities()
+	capMap := make(map[string]bool)
+	for _, capability := range capabilities {
+		capMap[capability] = true
+	}
+
+	if _, ok := capMap["com.amazonaws.ecs.capability.task-iam-role-network-host"]; ok {
+		t.Errorf("task-iam-role capability set for unsupported docker version")
+	}
+}
+
 func TestGetTaskByArn(t *testing.T) {
 	// Need a mock client as AddTask not only adds a task to the engine, but
 	// also causes the engine to progress the task.
-	ctrl, client, taskEngine := mocks(t, &defaultConfig)
+
+	ctrl, client, _, taskEngine, _, imageManager := mocks(t, &defaultConfig)
 	defer ctrl.Finish()
+
 	eventStream := make(chan DockerContainerChangeEvent)
 	client.EXPECT().ContainerEvents(gomock.Any()).Return(eventStream, nil)
+	imageManager.EXPECT().AddAllImageStates(gomock.Any()).AnyTimes()
+	client.EXPECT().PullImage(gomock.Any(), gomock.Any()).AnyTimes() // TODO change to MaxTimes(1)
 	err := taskEngine.Init()
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer taskEngine.Disable()
 
 	sleepTask := testdata.LoadTask("sleep5")
 	sleepTaskArn := sleepTask.Arn

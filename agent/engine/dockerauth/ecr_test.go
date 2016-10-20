@@ -1,3 +1,4 @@
+// +build !integration
 // Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
@@ -61,7 +62,7 @@ func TestNewAuthProviderECRAuth(t *testing.T) {
 func TestGetAuthConfigSuccess(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_ecr.NewMockECRSDK(ctrl)
+	client := mock_ecr.NewMockECRClient(ctrl)
 
 	authData := &api.ECRAuthData{
 		Region:           "us-west-2",
@@ -77,21 +78,9 @@ func TestGetAuthConfigSuccess(t *testing.T) {
 		authData: authData,
 	}
 
-	client.EXPECT().GetAuthorizationToken(gomock.Any()).Do(
-		func(input *ecrapi.GetAuthorizationTokenInput) {
-			if input == nil {
-				t.Fatal("Called with nil input")
-			}
-			if len(input.RegistryIds) != 1 {
-				t.Fatalf("Unexpected number of RegistryIds, expected 1 but got %d", len(input.RegistryIds))
-			}
-		}).Return(&ecrapi.GetAuthorizationTokenOutput{
-		AuthorizationData: []*ecrapi.AuthorizationData{
-			&ecrapi.AuthorizationData{
-				ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
-				AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
-			},
-		},
+	client.EXPECT().GetAuthorizationToken(authData.RegistryId).Return(&ecrapi.AuthorizationData{
+		ProxyEndpoint:      aws.String(proxyEndpointScheme + proxyEndpoint),
+		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 	}, nil)
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint + "/myimage")
@@ -112,7 +101,7 @@ func TestGetAuthConfigSuccess(t *testing.T) {
 func TestGetAuthConfigNoMatchAuthorizationToken(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_ecr.NewMockECRSDK(ctrl)
+	client := mock_ecr.NewMockECRClient(ctrl)
 
 	authData := &api.ECRAuthData{
 		Region:           "us-west-2",
@@ -128,21 +117,9 @@ func TestGetAuthConfigNoMatchAuthorizationToken(t *testing.T) {
 		authData: authData,
 	}
 
-	client.EXPECT().GetAuthorizationToken(gomock.Any()).Do(
-		func(input *ecrapi.GetAuthorizationTokenInput) {
-			if input == nil {
-				t.Fatal("Called with nil input")
-			}
-			if len(input.RegistryIds) != 1 {
-				t.Fatalf("Unexpected number of RegistryIds, expected 1 but got %d", len(input.RegistryIds))
-			}
-		}).Return(&ecrapi.GetAuthorizationTokenOutput{
-		AuthorizationData: []*ecrapi.AuthorizationData{
-			&ecrapi.AuthorizationData{
-				ProxyEndpoint:      aws.String(proxyEndpointScheme + "notproxy"),
-				AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
-			},
-		},
+	client.EXPECT().GetAuthorizationToken(authData.RegistryId).Return(&ecrapi.AuthorizationData{
+		ProxyEndpoint:      aws.String(proxyEndpointScheme + "notproxy"),
+		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString([]byte(username + ":" + password))),
 	}, nil)
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint + "/myimage")
@@ -158,7 +135,7 @@ func TestGetAuthConfigNoMatchAuthorizationToken(t *testing.T) {
 func TestGetAuthConfigBadBase64(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_ecr.NewMockECRSDK(ctrl)
+	client := mock_ecr.NewMockECRClient(ctrl)
 
 	authData := &api.ECRAuthData{
 		Region:           "us-west-2",
@@ -174,21 +151,9 @@ func TestGetAuthConfigBadBase64(t *testing.T) {
 		authData: authData,
 	}
 
-	client.EXPECT().GetAuthorizationToken(gomock.Any()).Do(
-		func(input *ecrapi.GetAuthorizationTokenInput) {
-			if input == nil {
-				t.Fatal("Called with nil input")
-			}
-			if len(input.RegistryIds) != 1 {
-				t.Fatalf("Unexpected number of RegistryIds, expected 1 but got %d", len(input.RegistryIds))
-			}
-		}).Return(&ecrapi.GetAuthorizationTokenOutput{
-		AuthorizationData: []*ecrapi.AuthorizationData{
-			&ecrapi.AuthorizationData{
-				ProxyEndpoint:      aws.String(proxyEndpoint),
-				AuthorizationToken: aws.String(username + ":" + password),
-			},
-		},
+	client.EXPECT().GetAuthorizationToken(authData.RegistryId).Return(&ecrapi.AuthorizationData{
+		ProxyEndpoint:      aws.String(proxyEndpointScheme + "notproxy"),
+		AuthorizationToken: aws.String((username + ":" + password)),
 	}, nil)
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint + "/myimage")
@@ -204,7 +169,7 @@ func TestGetAuthConfigBadBase64(t *testing.T) {
 func TestGetAuthConfigMissingResponse(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_ecr.NewMockECRSDK(ctrl)
+	client := mock_ecr.NewMockECRClient(ctrl)
 
 	authData := &api.ECRAuthData{
 		Region:           "us-west-2",
@@ -218,15 +183,7 @@ func TestGetAuthConfigMissingResponse(t *testing.T) {
 		authData: authData,
 	}
 
-	client.EXPECT().GetAuthorizationToken(gomock.Any()).Do(
-		func(input *ecrapi.GetAuthorizationTokenInput) {
-			if input == nil {
-				t.Fatal("Called with nil input")
-			}
-			if len(input.RegistryIds) != 1 {
-				t.Fatalf("Unexpected number of RegistryIds, expected 1 but got %d", len(input.RegistryIds))
-			}
-		})
+	client.EXPECT().GetAuthorizationToken(authData.RegistryId)
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint + "/myimage")
 	if err == nil {
@@ -241,7 +198,7 @@ func TestGetAuthConfigMissingResponse(t *testing.T) {
 func TestGetAuthConfigECRError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_ecr.NewMockECRSDK(ctrl)
+	client := mock_ecr.NewMockECRClient(ctrl)
 
 	authData := &api.ECRAuthData{
 		Region:           "us-west-2",
@@ -255,15 +212,7 @@ func TestGetAuthConfigECRError(t *testing.T) {
 		authData: authData,
 	}
 
-	client.EXPECT().GetAuthorizationToken(gomock.Any()).Do(
-		func(input *ecrapi.GetAuthorizationTokenInput) {
-			if input == nil {
-				t.Fatal("Called with nil input")
-			}
-			if len(input.RegistryIds) != 1 {
-				t.Fatalf("Unexpected number of RegistryIds, expected 1 but got %d", len(input.RegistryIds))
-			}
-		}).Return(nil, errors.New("test error"))
+	client.EXPECT().GetAuthorizationToken(authData.RegistryId).Return(nil, errors.New("test error"))
 
 	authconfig, err := provider.GetAuthconfig(proxyEndpoint + "/myimage")
 	if err == nil {
@@ -278,7 +227,7 @@ func TestGetAuthConfigECRError(t *testing.T) {
 func TestGetAuthConfigNoAuthData(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	client := mock_ecr.NewMockECRSDK(ctrl)
+	client := mock_ecr.NewMockECRClient(ctrl)
 
 	proxyEndpoint := "proxy"
 

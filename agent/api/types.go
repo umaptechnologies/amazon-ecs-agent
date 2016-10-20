@@ -1,4 +1,4 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -93,9 +93,13 @@ type Task struct {
 	Containers []*Container
 	Volumes    []TaskVolume `json:"volumes"`
 
-	DesiredStatus   TaskStatus
-	KnownStatus     TaskStatus
-	KnownStatusTime time.Time `json:"KnownTime"`
+	DesiredStatus     TaskStatus
+	desiredStatusLock sync.RWMutex
+
+	KnownStatus         TaskStatus
+	knownStatusLock     sync.RWMutex
+	KnownStatusTime     time.Time `json:"KnownTime"`
+	knownStatusTimeLock sync.RWMutex
 
 	SentStatus TaskStatus
 
@@ -104,6 +108,12 @@ type Task struct {
 
 	StartSequenceNumber int64
 	StopSequenceNumber  int64
+
+	// credentialsId is used to set the CredentialsId field for the
+	// IAMRoleCredentials object associated with the task. This id can be
+	// used to look up the credentials for task in the credentials manager
+	credentialsId     string
+	credentialsIdLock sync.RWMutex
 }
 
 // TaskVolume is a definition of all the volumes available for containers to
@@ -199,10 +209,10 @@ func (t *TaskStateChange) String() string {
 }
 
 func (t *Task) String() string {
-	res := fmt.Sprintf("%s:%s %s, Status: (%s->%s)", t.Family, t.Version, t.Arn, t.KnownStatus.String(), t.DesiredStatus.String())
+	res := fmt.Sprintf("%s:%s %s, Status: (%s->%s)", t.Family, t.Version, t.Arn, t.GetKnownStatus().String(), t.DesiredStatus.String())
 	res += " Containers: ["
 	for _, c := range t.Containers {
-		res += fmt.Sprintf("%s (%s->%s),", c.Name, c.KnownStatus.String(), c.DesiredStatus.String())
+		res += fmt.Sprintf("%s (%s->%s),", c.Name, c.GetKnownStatus().String(), c.GetDesiredStatus().String())
 	}
 	return res + "]"
 }
@@ -228,8 +238,11 @@ type Container struct {
 	DockerConfig           DockerConfig                `json:"dockerConfig"`
 	RegistryAuthentication *RegistryAuthenticationData `json:"registryAuthentication"`
 
-	DesiredStatus ContainerStatus `json:"desiredStatus"`
-	KnownStatus   ContainerStatus
+	DesiredStatus     ContainerStatus `json:"desiredStatus"`
+	desiredStatusLock sync.RWMutex
+
+	KnownStatus     ContainerStatus
+	knownStatusLock sync.RWMutex
 
 	// RunDependencies is a list of containers that must be run before
 	// this one is created
@@ -278,7 +291,7 @@ type ECRAuthData struct {
 }
 
 func (c *Container) String() string {
-	ret := fmt.Sprintf("%s(%s) (%s->%s)", c.Name, c.Image, c.KnownStatus.String(), c.DesiredStatus.String())
+	ret := fmt.Sprintf("%s(%s) (%s->%s)", c.Name, c.Image, c.GetKnownStatus().String(), c.GetDesiredStatus().String())
 	if c.KnownExitCode != nil {
 		ret += " - Exit: " + strconv.Itoa(*c.KnownExitCode)
 	}

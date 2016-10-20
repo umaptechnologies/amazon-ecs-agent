@@ -1,4 +1,4 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -20,24 +20,35 @@ import (
 	"strconv"
 	"strings"
         "os"
+	"time"
 
 	"github.com/aws/amazon-ecs-agent/agent/acs/model/ecsacs"
+	"github.com/aws/amazon-ecs-agent/agent/credentials"
 	"github.com/aws/amazon-ecs-agent/agent/engine/emptyvolume"
 	"github.com/aws/amazon-ecs-agent/agent/utils/ttime"
 	"github.com/aws/aws-sdk-go/private/protocol/json/jsonutil"
+	"github.com/cihub/seelog"
 	"github.com/fsouza/go-dockerclient"
 )
 
-const emptyHostVolumeName = "~internal~ecs-emptyvolume-source"
+const (
+	emptyHostVolumeName = "~internal~ecs-emptyvolume-source"
+
+	// awsSDKCredentialsRelativeURIPathEnvironmentVariableName defines the name of the environment
+	// variable containers' config, which will be used by the AWS SDK to fetch
+	// credentials.
+	awsSDKCredentialsRelativeURIPathEnvironmentVariableName = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+)
 
 // PostUnmarshalTask is run after a task has been unmarshalled, but before it has been
 // run. It is possible it will be subsequently called after that and should be
 // able to handle such an occurrence appropriately (e.g. behave idempotently).
-func (task *Task) PostUnmarshalTask() {
+func (task *Task) PostUnmarshalTask(credentialsManager credentials.Manager) {
 	// TODO, add rudimentary plugin support and call any plugins that want to
 	// hook into this
 
 	task.initializeEmptyVolumes()
+	task.initializeCredentialsEndpoint(credentialsManager)
 }
 
 func (task *Task) initializeEmptyVolumes() {
@@ -86,7 +97,42 @@ func (task *Task) initializeEmptyVolumes() {
 
 }
 
-func (task *Task) _containersByName() map[string]*Container {
+// initializeCredentialsEndpoint sets the credentials endpoint for all containers in a task if needed.
+func (task *Task) initializeCredentialsEndpoint(credentialsManager credentials.Manager) {
+	id := task.GetCredentialsId()
+	if id == "" {
+		// No credentials set for the task. Do not inject the endpoint environment variable.
+		return
+	}
+	taskCredentials, ok := credentialsManager.GetTaskCredentials(id)
+	if !ok {
+		// Task has credentials id set, but credentials manager is unaware of
+		// the id. This should never happen as the payload handler sets
+		// credentialsId for the task after adding credentials to the
+		// credentials manager
+		seelog.Errorf("Unable to get credentials for task: %s", task.Arn)
+		return
+	}
+
+	credentialsEndpointRelativeURI := taskCredentials.IAMRoleCredentials.GenerateCredentialsEndpointRelativeURI()
+	for _, container := range task.Containers {
+		// container.Environment map would not be initialized if there are
+		// no environment variables to be set or overridden in the container
+		// config. Check if that's the case and initilialize if needed
+		if container.Environment == nil {
+			container.Environment = make(map[string]string)
+		}
+		container.Environment[awsSDKCredentialsRelativeURIPathEnvironmentVariableName] = credentialsEndpointRelativeURI
+	}
+
+}
+
+func (task *Task) ContainerByName(name string) (*Container, bool) {
+	container, ok := task.getContainersByName()[name]
+	return container, ok
+}
+
+func (task *Task) getContainersByName() map[string]*Container {
 	task.containersByNameLock.Lock()
 	defer task.containersByNameLock.Unlock()
 
@@ -98,11 +144,6 @@ func (task *Task) _containersByName() map[string]*Container {
 		task.containersByName[container.Name] = container
 	}
 	return task.containersByName
-}
-
-func (task *Task) ContainerByName(name string) (*Container, bool) {
-	container, ok := task._containersByName()[name]
-	return container, ok
 }
 
 // HostVolumeByName returns the task Volume for the given a volume name in that
@@ -137,8 +178,9 @@ func (task *Task) UpdateMountPoints(cont *Container, vols map[string]string) {
 // task's desired status
 func (task *Task) updateContainerDesiredStatus() {
 	for _, c := range task.Containers {
-		if c.DesiredStatus < task.DesiredStatus.ContainerStatus() {
-			c.DesiredStatus = task.DesiredStatus.ContainerStatus()
+		taskDesiredStatus := task.GetDesiredStatus()
+		if c.GetDesiredStatus() < taskDesiredStatus.ContainerStatus() {
+			c.SetDesiredStatus(taskDesiredStatus.ContainerStatus())
 		}
 	}
 }
@@ -154,15 +196,16 @@ func (task *Task) updateTaskKnownStatus() (newStatus TaskStatus) {
 	// Set to a large 'impossible' status that can't be the min
 	earliestStatus := ContainerZombie
 	for _, cont := range task.Containers {
-		if cont.KnownStatus < earliestStatus {
-			earliestStatus = cont.KnownStatus
+		contKnownStatus := cont.GetKnownStatus()
+		if contKnownStatus < earliestStatus {
+			earliestStatus = contKnownStatus
 		}
 	}
 
 	llog.Debug("Earliest status is " + earliestStatus.String())
-	if task.KnownStatus < earliestStatus.TaskStatus() {
-		task.SetKnownStatus(earliestStatus.TaskStatus())
-		return task.KnownStatus
+	if task.GetKnownStatus() < earliestStatus.TaskStatus() {
+		task.UpdateKnownStatusAndTime(earliestStatus.TaskStatus())
+		return task.GetKnownStatus()
 	}
 	return TaskStatusNone
 }
@@ -233,14 +276,6 @@ func (task *Task) dockerConfig(container *Container) (*docker.Config, *DockerCli
 	if config.Labels == nil {
 		config.Labels = make(map[string]string)
 	}
-
-	// Augment labels with some metadata from the agent. Explicitly do this last
-	// such that it will always override duplicates in the provided raw config
-	// data.
-	config.Labels["com.amazonaws.ecs.task-arn"] = task.Arn
-	config.Labels["com.amazonaws.ecs.container-name"] = container.Name
-	config.Labels["com.amazonaws.ecs.task-definition-family"] = task.Family
-	config.Labels["com.amazonaws.ecs.task-definition-version"] = task.Version
 
 	return config, nil
 }
@@ -446,6 +481,8 @@ func (task *Task) dockerHostBinds(container *Container) ([]string, error) {
 	return binds, nil
 }
 
+// TaskFromACS translates ecsacs.Task to api.Task by first marshaling the recieved
+// ecsacs.Task to json and unmrashaling it as api.Task
 func TaskFromACS(acsTask *ecsacs.Task, envelope *ecsacs.PayloadMessage) (*Task, error) {
 	data, err := jsonutil.BuildJSON(acsTask)
 	if err != nil {
@@ -456,9 +493,10 @@ func TaskFromACS(acsTask *ecsacs.Task, envelope *ecsacs.PayloadMessage) (*Task, 
 	if err != nil {
 		return nil, err
 	}
-	if task.DesiredStatus == TaskRunning && envelope.SeqNum != nil {
+
+	if task.GetDesiredStatus() == TaskRunning && envelope.SeqNum != nil {
 		task.StartSequenceNumber = *envelope.SeqNum
-	} else if task.DesiredStatus == TaskStopped && envelope.SeqNum != nil {
+	} else if task.GetDesiredStatus() == TaskStopped && envelope.SeqNum != nil {
 		task.StopSequenceNumber = *envelope.SeqNum
 	}
 
@@ -473,9 +511,9 @@ func (task *Task) updateTaskDesiredStatus() {
 	// A task's desired status is stopped if any essential container is stopped
 	// Otherwise, the task's desired status is unchanged (typically running, but no need to change)
 	for _, cont := range task.Containers {
-		if cont.Essential && (cont.KnownStatus.Terminal() || cont.DesiredStatus.Terminal()) {
+		if cont.Essential && (cont.KnownTerminal() || cont.DesiredTerminal()) {
 			llog.Debug("Updating task desired status to stopped", "container", cont.Name)
-			task.DesiredStatus = TaskStopped
+			task.SetDesiredStatus(TaskStopped)
 		}
 	}
 }
@@ -483,19 +521,84 @@ func (task *Task) updateTaskDesiredStatus() {
 // UpdateStatus updates a task's known and desired statuses to be compatible
 // with all of its containers
 // It will return a bool indicating if there was a change
-func (t *Task) UpdateStatus() bool {
-	change := t.updateTaskKnownStatus()
+func (task *Task) UpdateStatus() bool {
+	change := task.updateTaskKnownStatus()
 	// DesiredStatus can change based on a new known status
-	t.UpdateDesiredStatus()
+	task.UpdateDesiredStatus()
 	return change != TaskStatusNone
 }
 
-func (t *Task) UpdateDesiredStatus() {
-	t.updateTaskDesiredStatus()
-	t.updateContainerDesiredStatus()
+func (task *Task) UpdateDesiredStatus() {
+	task.updateTaskDesiredStatus()
+	task.updateContainerDesiredStatus()
 }
 
-func (t *Task) SetKnownStatus(status TaskStatus) {
-	t.KnownStatus = status
-	t.KnownStatusTime = ttime.Now()
+func (task *Task) SetKnownStatus(status TaskStatus) {
+	task.setKnownStatus(status)
+	task.updateKnownStatusTime()
+}
+
+// UpdateKnownStatusAndTime updates the KnownStatus and KnownStatusTime
+// of the task
+func (task *Task) UpdateKnownStatusAndTime(status TaskStatus) {
+	task.setKnownStatus(status)
+	task.updateKnownStatusTime()
+}
+
+// GetKnownStatus gets the KnownStatus of the task
+func (task *Task) GetKnownStatus() TaskStatus {
+	task.knownStatusLock.RLock()
+	defer task.knownStatusLock.RUnlock()
+
+	return task.KnownStatus
+}
+
+// GetKnownStatusTime gets the KnownStatusTime of the task
+func (task *Task) GetKnownStatusTime() time.Time {
+	task.knownStatusTimeLock.RLock()
+	defer task.knownStatusTimeLock.RUnlock()
+
+	return task.KnownStatusTime
+}
+
+func (task *Task) setKnownStatus(status TaskStatus) {
+	task.knownStatusLock.Lock()
+	defer task.knownStatusLock.Unlock()
+
+	task.KnownStatus = status
+}
+
+func (task *Task) updateKnownStatusTime() {
+	task.knownStatusTimeLock.Lock()
+	defer task.knownStatusTimeLock.Unlock()
+
+	task.KnownStatusTime = ttime.Now()
+}
+
+func (task *Task) SetCredentialsId(id string) {
+	task.credentialsIdLock.Lock()
+	defer task.credentialsIdLock.Unlock()
+
+	task.credentialsId = id
+}
+
+func (task *Task) GetCredentialsId() string {
+	task.credentialsIdLock.RLock()
+	defer task.credentialsIdLock.RUnlock()
+
+	return task.credentialsId
+}
+
+func (task *Task) GetDesiredStatus() TaskStatus {
+	task.desiredStatusLock.RLock()
+	defer task.desiredStatusLock.RUnlock()
+
+	return task.DesiredStatus
+}
+
+func (task *Task) SetDesiredStatus(status TaskStatus) {
+	task.desiredStatusLock.Lock()
+	defer task.desiredStatusLock.Unlock()
+
+	task.DesiredStatus = status
 }

@@ -1,9 +1,54 @@
 # Changelog
 
+## 1.13.0
+* Feature - Implemented automated image cleanup.
+* Enhancement - Add credential caching for ECR.
+* Enhancement - Add support for security-opt=no-new-privileges.
+* Bug - Fixed a potential deadlock in dockerstate.
+
+## 1.12.2
+* Bug - Fixed a bug where agent keeps fetching stats of stopped containers.
+
+## 1.12.1
+* Bug - Fixed a bug where agent keeps fetching stats of stopped containers.
+* Bug - Fixed a bug that could lead to exhausting the open file limit.
+* Bug - Fixed a bug where the introspection API could return the wrong response code.
+
+## 1.12.0
+* Enhancement - Support Task IAM Role for containers launched with 'host' network mode.
+
+## 1.11.1
+* Bug - Fixed a bug where telemetry data would fail to serialize properly.
+* Bug - Addressed an issue where telemetry would be reported after the
+  container instance was deregistered.
+
+## 1.11.0
+* Feature - Support IAM roles for tasks.
+* Feature - Add support for the Splunk logging driver.
+* Enhancement - Reduced pull status verbosity in debug mode.
+* Enhancement - Add a Docker label for ECS cluster.
+* Bug - Fixed a bug that could cause a container to be marked as STOPPED while
+  still running on the instance.
+* Bug - Fixed a potential race condition in metrics collection.
+* Bug - Resolved a bug where some state could be retained across different
+  container instances when launching from a snapshotted AMI.
+
+## 1.10.0
+* Feature - Make the `docker stop` timeout configurable.
+* Enhancement - Use `docker stats` as the data source for CloudWatch metrics.
+* Bug - Fixed an issue where update requests would not be properly acknowledged
+  when updates were disabled.
+
+## 1.9.0
+* Feature - Add Amazon CloudWatch Logs logging driver.
+* Bug - Fixed ACS handler when acking blank message ids.
+* Bug - Fixed an issue where CPU utilization could be reported incorrectly.
+* Bug - Resolved a bug where containers would not get cleaned up in some cases.
+
 ## 1.8.2
 * Bug - Fixed an issue where `exec_create` and `exec_start` events were not
   correctly ignored with some Docker versions.
-* Bug - Fixed memory utilization computation. 
+* Bug - Fixed memory utilization computation.
 * Bug - Resolved a bug where sending a signal to a container caused the
   agent to treat the container as dead.
 

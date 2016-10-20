@@ -1,4 +1,4 @@
-// Copyright 2014-2015 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+// Copyright 2014-2016 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License"). You may
 // not use this file except in compliance with the License. A copy of the
@@ -23,7 +23,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
@@ -33,14 +33,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/amazon-ecs-agent/agent/logger"
 	"github.com/aws/amazon-ecs-agent/agent/utils"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/private/protocol/json/jsonutil"
+	"github.com/cihub/seelog"
 	"github.com/gorilla/websocket"
 )
-
-var log = logger.ForModule("ws client")
 
 const (
 	// ServiceName defines the service name for the agent. This is used to sign messages
@@ -92,6 +90,7 @@ type ClientServer interface {
 	SetAnyRequestHandler(RequestHandler)
 	MakeRequest(input interface{}) error
 	Connect() error
+	Disconnect(...interface{}) error
 	Serve() error
 	io.Closer
 }
@@ -150,7 +149,7 @@ func (cs *ClientServerImpl) Connect() error {
 			var readErr error
 			resp, readErr = ioutil.ReadAll(httpResponse.Body)
 			if readErr != nil {
-				return errors.New("Unable to read websocket connection: " + readErr.Error() + ", " + err.Error())
+				return fmt.Errorf("Unable to read websocket connection: " + readErr.Error() + ", " + err.Error())
 			}
 			// If there's a response, we can try to unmarshal it into one of the
 			// modeled error types
@@ -159,11 +158,20 @@ func (cs *ClientServerImpl) Connect() error {
 				return cs.NewError(possibleError)
 			}
 		}
-		log.Warn("Error creating a websocket client", "err", err)
-		return errors.New(string(resp) + ", " + err.Error())
+		seelog.Warnf("Error creating a websocket client: %v", err)
+		return fmt.Errorf(string(resp) + ", " + err.Error())
 	}
 	cs.Conn = websocketConn
 	return nil
+}
+
+// Disconnect disconnects the connection
+func (cs *ClientServerImpl) Disconnect(...interface{}) error {
+	if cs.Conn != nil {
+		return cs.Conn.Close()
+	}
+
+	return fmt.Errorf("No Connection to close")
 }
 
 // AddRequestHandler adds a request handler to this client.
@@ -214,18 +222,18 @@ func (cs *ClientServerImpl) ConsumeMessages() error {
 		if err != nil {
 			if err != io.EOF && err != io.ErrUnexpectedEOF {
 				if message != nil {
-					log.Error("Error getting message from ws backend", "err", err, "message", message)
+					seelog.Errorf("Error getting message from ws backend: %v, message: %v", err, string(message))
 				} else {
-					log.Error("Error getting message from ws backend", "err", err)
+					seelog.Errorf("Error getting message from ws backend: %v", err)
 				}
 			}
 			break
 		}
 		if messageType != websocket.TextMessage {
-			log.Error("Unexpected messageType", "type", messageType)
+			seelog.Errorf("Unexpected messageType: %s", messageType)
 			// maybe not fatal though, we'll try to process it anyways
 		}
-		log.Debug("Got a message from websocket", "message", string(message[:]))
+		seelog.Debug("Got a message from websocket")
 		cs.handleMessage(message)
 	}
 	return err
@@ -265,9 +273,11 @@ func (cs *ClientServerImpl) CreateRequestMessage(input interface{}) ([]byte, err
 func (cs *ClientServerImpl) handleMessage(data []byte) {
 	typedMessage, typeStr, err := DecodeData(data, cs.TypeDecoder)
 	if err != nil {
-		log.Warn("Unable to handle message from backend", "err", err)
+		seelog.Warnf("Unable to handle message from backend: %v", err)
 		return
 	}
+
+	seelog.Debugf("Received message of type: %s", typeStr)
 
 	if cs.AnyRequestHandler != nil {
 		reflect.ValueOf(cs.AnyRequestHandler).Call([]reflect.Value{reflect.ValueOf(typedMessage)})
@@ -276,7 +286,7 @@ func (cs *ClientServerImpl) handleMessage(data []byte) {
 	if handler, ok := cs.RequestHandlers[typeStr]; ok {
 		reflect.ValueOf(handler).Call([]reflect.Value{reflect.ValueOf(typedMessage)})
 	} else {
-		log.Info("No handler for message type", "type", typeStr)
+		seelog.Infof("No handler for message type: %s", typeStr)
 	}
 }
 
@@ -306,12 +316,12 @@ func (cs *ClientServerImpl) websocketConn(parsedURL *url.URL, request *http.Requ
 
 	if proxyURL == nil {
 		// directly connect
-		log.Info("Creating poll dialer", "host", parsedURL.Host)
+		seelog.Infof("Creating poll dialer, host: %s", parsedURL.Host)
 		return tls.DialWithDialer(timeoutDialer, "tcp", targetHost, &tlsConfig)
 	}
 
 	// connect via proxy
-	log.Info("Creating poll dialer", "proxy", proxyURL.Host, "host", parsedURL.Host)
+	seelog.Infof("Creating poll dialer, proxy: %s", proxyURL.Host)
 	plainConn, err := timeoutDialer.Dial("tcp", proxyURL.Host)
 	if err != nil {
 		return nil, err
@@ -345,7 +355,7 @@ func (cs *ClientServerImpl) websocketConn(parsedURL *url.URL, request *http.Requ
 	}
 	if resp.StatusCode != 200 {
 		plainConn.Close()
-		return nil, errors.New(resp.Status)
+		return nil, fmt.Errorf(resp.Status)
 	}
 
 	tlsConn := tls.Client(plainConn, &tlsConfig)
